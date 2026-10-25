@@ -125,6 +125,26 @@ run() {
 # ---------------------------------------------------------------- uninstall
 if [ "$UNINSTALL" -eq 1 ]; then
   step "Uninstalling"
+
+  # Refuse to rm -rf anything that is not a plausible hooks directory.
+  #
+  # Without this, `./install.sh --uninstall --hooks-dir ~` deletes the home
+  # directory, and `--hooks-dir /` deletes the filesystem. The cost of the
+  # mistake is unbounded, so the guard is deliberately blunt: the path must be
+  # absolute, must not be a top-level directory, and must not be $HOME itself.
+  if [ -d "$DEST" ]; then
+    case "$DEST" in
+      /|"$HOME"|"$HOME"/|/Users|/home|/root|/etc|/usr|/var|/bin|/sbin|/opt|/tmp)
+        die "refusing to remove $DEST — that is not a hooks directory. Remove it yourself if you are certain."
+        ;;
+    esac
+    # Must be at least two levels deep (e.g. /Users/you/.copilot/hooks/ledger).
+    DEPTH="$(printf '%s' "$DEST" | tr -cd '/' | wc -c | tr -d ' ')"
+    if [ "$DEPTH" -lt 2 ]; then
+      die "refusing to remove $DEST — path is too shallow to be a hooks directory."
+    fi
+  fi
+
   if [ -f "$CONFIG" ]; then
     run rm -f "$CONFIG"
     say "  removed $CONFIG"
@@ -153,7 +173,8 @@ for f in core/index.cjs core/ledger.cjs core/extract.cjs core/llm.cjs core/trace
          adapters/vscode/session.cjs adapters/vscode/prompt-submitted.cjs \
          adapters/vscode/before-tool.cjs adapters/vscode/after-tool.cjs \
          adapters/vscode/turn-end.cjs adapters/vscode/_io.cjs \
-         tools/caps-report.cjs tools/cost-report.cjs tools/inspect.sh; do
+         tools/caps-report.cjs tools/cost-report.cjs tools/inspect.sh \
+         tools/verdict-check.cjs tools/audit-preview.cjs; do
   [ -f "$REPO_DIR/$f" ] || die "missing $REPO_DIR/$f — run this from the repo root."
 done
 say "  hook scripts present"
@@ -258,7 +279,13 @@ for f in "$REPO_DIR"/adapters/vscode/*.cjs; do
 done
 
 # Operator tools.
-for f in caps-report.cjs cost-report.cjs; do
+#
+# This list must stay in sync with what core/ actually requires. core/extract.cjs
+# requires ../tools/verdict-check.cjs, so omitting it here makes every hook throw
+# MODULE_NOT_FOUND on a fresh install — and because the adapters catch and emit
+# {}, the failure is silent. There is a CI job that installs into a temp dir and
+# runs a hook to catch exactly this.
+for f in caps-report.cjs cost-report.cjs verdict-check.cjs audit-preview.cjs; do
   run cp "$REPO_DIR/tools/$f" "$DEST/tools/$f"
 done
 run cp "$REPO_DIR/tools/inspect.sh" "$DEST/inspect.sh"
@@ -274,24 +301,30 @@ fi
 if [ "$DRY_RUN" -eq 1 ]; then
   say "  [dry-run] would write $CONFIG"
 else
-  cat > "$CONFIG" <<'JSON'
+  # NOTE: unquoted heredoc delimiter (JSON, not 'JSON') so $DEST expands.
+  # The paths MUST come from $DEST — hardcoding ~/.copilot/hooks/ledger here
+  # meant --hooks-dir installed the scripts to one place and pointed the config
+  # at another, so the hooks silently never ran.
+  #
+  # $DEST is expanded to an absolute path by expand_tilde, so no ~ remains.
+  cat > "$CONFIG" <<JSON
 {
   "version": 1,
   "hooks": {
     "sessionStart": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/session.cjs", "timeoutSec": 15 }
+      { "type": "command", "command": "node $DEST/adapters/vscode/session.cjs", "timeoutSec": 15 }
     ],
     "userPromptSubmitted": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/prompt-submitted.cjs", "timeoutSec": 45 }
+      { "type": "command", "command": "node $DEST/adapters/vscode/prompt-submitted.cjs", "timeoutSec": 45 }
     ],
     "preToolUse": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/before-tool.cjs", "timeoutSec": 15 }
+      { "type": "command", "command": "node $DEST/adapters/vscode/before-tool.cjs", "timeoutSec": 15 }
     ],
     "postToolUse": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/after-tool.cjs", "timeoutSec": 15 }
+      { "type": "command", "command": "node $DEST/adapters/vscode/after-tool.cjs", "timeoutSec": 15 }
     ],
     "agentStop": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/turn-end.cjs", "timeoutSec": 45 }
+      { "type": "command", "command": "node $DEST/adapters/vscode/turn-end.cjs", "timeoutSec": 45 }
     ]
   }
 }

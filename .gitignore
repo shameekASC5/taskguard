@@ -1,0 +1,22 @@
+# Credentials — never commit
+.env
+*.env
+!.env.example
+
+# Runtime state
+.ledger/
+*.log
+*.log.jsonl
+hook-trace.log.jsonl
+event-probe.log.jsonl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Node
+node_modules/
+npm-debug.log*

@@ -1,0 +1,24 @@
+{
+  "name": "taskguard",
+  "version": "1.0.0",
+  "description": "A VS Code Copilot hook that stops the agent from silently dropping your questions and tasks.",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "test": "jest --runInBand",
+    "test:watch": "jest --runInBand --watch"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": [
+      "<rootDir>/test/**/*.test.js"
+    ],
+    "testTimeout": 30000
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

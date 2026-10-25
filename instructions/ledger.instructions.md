@@ -11,7 +11,7 @@ hooks do. The agent's only job is to respond to the nudges.
 
 ## What you will see
 
-Three kinds of injected text, all marked with `OPEN ITEMS LEDGER`:
+Three kinds of injected text, all marked with `OPEN ITEMS (taskguard)`:
 
 1. **At the start of a turn** — the ledger is appended to the user's prompt.
 2. **After tool calls** — a reminder is appended to tool output.

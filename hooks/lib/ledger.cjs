@@ -272,7 +272,7 @@ function renderNudge(ledger) {
   if (open.length === 0) return '';
   const lines = open.map((i) => `- [${i.id}] (${i.kind}) ${i.text}`);
   return [
-    'OPEN ITEMS LEDGER — these were requested and are not yet resolved:',
+    'OPEN ITEMS (taskguard) — these were requested and are not yet resolved:',
     ...lines,
     'Address each one, or explicitly state why it is no longer needed.',
   ].join('\n');

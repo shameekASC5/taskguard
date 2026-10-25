@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# install.sh — install the Copilot Ledger Hook.
+# install.sh — install taskguard.
 #
 # Safe to run repeatedly (idempotent). Backs up any existing config.
 #
@@ -265,6 +265,77 @@ step "Installing agent instructions"
 run mkdir -p "$INSTRUCTIONS_DIR"
 run cp "$REPO_DIR/instructions/ledger.instructions.md" "$INSTRUCTIONS_FILE"
 say "  installed $INSTRUCTIONS_FILE"
+
+# Copying the file is not enough: VS Code only loads instruction files from
+# directories listed in chat.instructionsFilesLocations. Without this the
+# agent receives ledger nudges but never learns how to respond to them, and
+# the install looks successful while being functionally half-broken.
+register_instructions_dir() {
+  local settings="$1"
+  [ -f "$settings" ] || return 1
+
+  if grep -q 'chat.instructionsFilesLocations' "$settings" 2>/dev/null; then
+    if grep -q '"~/.copilot/instructions"' "$settings" 2>/dev/null; then
+      say "  already registered in $(basename "$(dirname "$settings")")/settings.json"
+      return 0
+    fi
+    warn "chat.instructionsFilesLocations exists but does not include ~/.copilot/instructions"
+    warn "  add this entry manually:  \"~/.copilot/instructions\": true"
+    return 1
+  fi
+
+  # No existing key: append one. JSONC tolerates a trailing comma before the
+  # closing brace, which is the safest way to insert without a JSON parser.
+  local backup="$settings.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$settings" "$backup"
+  python3 - "$settings" <<'PY'
+import json, re, sys
+path = sys.argv[1]
+raw = open(path, encoding='utf-8').read()
+# Strip // comments and trailing commas so json can parse JSONC.
+stripped = re.sub(r'^\s*//.*$', '', raw, flags=re.M)
+stripped = re.sub(r',(\s*[}\]])', r'\1', stripped)
+try:
+    data = json.loads(stripped) if stripped.strip() else {}
+except Exception:
+    sys.exit(1)
+data.setdefault('chat.instructionsFilesLocations', {})['~/.copilot/instructions'] = True
+open(path, 'w', encoding='utf-8').write(json.dumps(data, indent=4) + '\n')
+PY
+  if [ $? -eq 0 ]; then
+    say "  registered ~/.copilot/instructions in settings.json"
+    say "  (backup: $backup)"
+    return 0
+  fi
+  warn "  could not parse settings.json; add this manually:"
+  warn '    "chat.instructionsFilesLocations": { "~/.copilot/instructions": true }'
+  return 1
+}
+
+SETTINGS_CANDIDATES=(
+  "$HOME/Library/Application Support/Code/User/settings.json"
+  "$HOME/.config/Code/User/settings.json"
+  "$HOME/AppData/Roaming/Code/User/settings.json"
+)
+
+REGISTERED=0
+for s in "${SETTINGS_CANDIDATES[@]}"; do
+  if [ -f "$s" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      say "  [dry-run] would register ~/.copilot/instructions in $s"
+      REGISTERED=1
+    elif register_instructions_dir "$s"; then
+      REGISTERED=1
+    fi
+    break
+  fi
+done
+
+if [ "$REGISTERED" -eq 0 ]; then
+  warn "no VS Code settings.json found."
+  warn "Add this to your user settings so the agent can read the instructions:"
+  warn '  "chat.instructionsFilesLocations": { "~/.copilot/instructions": true }'
+fi
 
 # ---------------------------------------------------------------- verify
 step "Health check"

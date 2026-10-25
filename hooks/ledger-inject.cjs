@@ -72,7 +72,7 @@ function main() {
     },
     // Visible in chat so the user can see the ledger being injected.
     // Plain ASCII only: emoji glyphs are multi-byte and can break parsing.
-    systemMessage: `LEDGER INJECTED: ${openCount} open item(s) this turn`,
+    systemMessage: `TASKGUARD: ${openCount} open item(s) this turn`,
   });
 }
 

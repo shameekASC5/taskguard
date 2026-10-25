@@ -216,6 +216,22 @@ You should see the ledger injected before the first tool call. If the agent answ
 
 If something looks wrong, `doctor` is the first thing to run. It checks the key, the model, and performs a real extraction against a known input.
 
+## Development
+
+```bash
+npm install
+npm test
+```
+
+26 tests, no network access required. The hook scripts are executed as real
+child processes with a JSON event on stdin — exactly how VS Code invokes them —
+and the model is stubbed by a local HTTP server. That covers the full contract:
+stdin parsing, ledger persistence, stdout JSON shape, and the block/nudge
+decisions.
+
+CI runs the suite on Node 18/20/22 across Linux and macOS, plus a hygiene job
+that fails the build if a credential or a local machine path is ever committed.
+
 ## How state is stored
 
 One JSON file per session in `~/.copilot/hooks/ledger/.ledger/`, named by the session UUID. Sessions are independent — two windows never share a ledger.

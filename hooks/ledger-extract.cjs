@@ -57,6 +57,13 @@ async function main() {
   ledger.mergeExtracted(led, extracted);
   // New turn: allow the inject hook to fire once more.
   led.injectedForTurn = false;
+  // New turn: re-arm the Stop hook's block budget.
+  //
+  // MAX_BLOCKS exists to stop a single turn looping forever, not to cap the
+  // whole session. Without this reset, three blocked turns anywhere in a
+  // session would silently disable enforcement for the rest of it — which is
+  // exactly the long sessions this tool is meant to protect.
+  led.blockCount = 0;
   ledger.save(led);
   trace('ledger-extract', 'saved', { sessionId, total: led.items.length });
 

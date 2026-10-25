@@ -202,7 +202,7 @@ async function main() {
   // Plain ASCII only: emoji and bullet glyphs are multi-byte and have been
   // observed to break harness parsing.
   const systemMessage = [
-    `LEDGER NUDGE #${blocks}: turn blocked - ${stillOpen.length} item(s) still open`,
+    `TASKGUARD NUDGE #${blocks}: turn blocked - ${stillOpen.length} item(s) still open`,
     ...stillOpen.map((i) => `  - [${i.id}] ${i.text}`),
     resolved > 0 ? `  (${resolved} resolved this turn)` : '',
   ].filter(Boolean).join('\n');

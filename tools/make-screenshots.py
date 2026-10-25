@@ -275,6 +275,21 @@ def make_warning():
 
 
 if __name__ == "__main__":
+    import sys
+
     os.makedirs(OUT_DIR, exist_ok=True)
-    for fn in (make_blocked, make_warning):
+
+    # blocked.png is a REAL screenshot and is intentionally not generated.
+    # It shows a genuine VS Code session, which is what makes it useful in the
+    # README. The only thing it exposes is a commit hash and a test count, and
+    # neither is sensitive. Generating over it would silently replace the real
+    # capture with a mock, so it is opt-in only.
+    #
+    #   python3 tools/make-screenshots.py            # warning.png only
+    #   python3 tools/make-screenshots.py --all      # also regenerate blocked.png
+    targets = [make_warning]
+    if "--all" in sys.argv:
+        targets.insert(0, make_blocked)
+
+    for fn in targets:
         print("wrote", fn())

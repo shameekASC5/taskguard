@@ -29,6 +29,8 @@ INSTRUCTIONS_FILE="$INSTRUCTIONS_DIR/ledger.instructions.md"
 DRY_RUN=0
 UNINSTALL=0
 API_KEY=""
+PROVIDER=""
+MODEL=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -36,8 +38,12 @@ while [ $# -gt 0 ]; do
     --uninstall) UNINSTALL=1 ;;
     --key)       shift; API_KEY="${1:-}" ;;
     --key=*)     API_KEY="${1#--key=}" ;;
+    --provider)  shift; PROVIDER="${1:-}" ;;
+    --provider=*) PROVIDER="${1#--provider=}" ;;
+    --model)     shift; MODEL="${1:-}" ;;
+    --model=*)   MODEL="${1#--model=}" ;;
     -h|--help)
-      sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -52,6 +58,14 @@ say()  { printf '%s\n' "$*"; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Interactive only when stdin is a real terminal AND the caller did not ask
+# for a non-interactive run. Agents and CI must never block on a prompt.
+INTERACTIVE=0
+if [ -t 0 ] && [ "${LEDGER_NONINTERACTIVE:-0}" != "1" ]; then
+  INTERACTIVE=1
+fi
+ask() { [ "$INTERACTIVE" -eq 1 ]; }
 
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -94,31 +108,89 @@ for f in ledger-session.cjs ledger-extract.cjs ledger-inject.cjs \
 done
 say "  hook scripts present"
 
+# ---------------------------------------------------------------- provider
+step "Model provider"
+if [ -z "$PROVIDER" ]; then
+  if ask; then
+    say "  Which provider will drive the two small calls per turn?"
+    say ""
+    say "    1) openrouter  (default — one key for every model)"
+    say "    2) openai"
+    say "    3) groq        (fast and cheap)"
+    say "    4) deepseek    (direct)"
+    say "    5) together"
+    say "    6) fireworks"
+    say "    7) ollama      (local, no key, no cost)"
+    say "    8) custom      (any OpenAI-compatible endpoint)"
+    say ""
+    printf '  Choice [1]: '
+    read -r CHOICE
+    case "${CHOICE:-1}" in
+      1) PROVIDER=openrouter ;;
+      2) PROVIDER=openai ;;
+      3) PROVIDER=groq ;;
+      4) PROVIDER=deepseek ;;
+      5) PROVIDER=together ;;
+      6) PROVIDER=fireworks ;;
+      7) PROVIDER=ollama ;;
+      8) PROVIDER=custom ;;
+      *) warn "unrecognised choice, using openrouter"; PROVIDER=openrouter ;;
+    esac
+  else
+    PROVIDER=openrouter
+  fi
+fi
+say "  provider: $PROVIDER"
+
+if [ "$PROVIDER" = "custom" ] && [ -z "${LEDGER_BASE_URL:-}" ]; then
+  if ask; then
+    printf '  Base URL (full chat-completions URL): '
+    read -r LEDGER_BASE_URL
+  fi
+  [ -n "${LEDGER_BASE_URL:-}" ] || die "custom provider needs LEDGER_BASE_URL"
+fi
+
+if [ -z "$MODEL" ]; then
+  # Only prompt when a human is actually there. Without this guard a
+  # non-interactive run (agent, CI, piped stdin) blocks forever on read.
+  if ask; then
+    printf '  Model id (blank = provider default): '
+    read -r MODEL || MODEL=""
+  fi
+fi
+[ -n "$MODEL" ] && say "  model: $MODEL"
+
 # ---------------------------------------------------------------- api key
-step "OpenRouter API key"
+step "API key"
+if [ "$PROVIDER" = "ollama" ]; then
+  say "  local provider — no key needed"
+  API_KEY="none"
+fi
+
 if [ -z "$API_KEY" ] && [ -f "$ENV_FILE" ]; then
   say "  existing key found in $ENV_FILE — keeping it"
   say "  (delete that file and re-run to change it)"
 fi
 
 if [ -z "$API_KEY" ] && [ ! -f "$ENV_FILE" ]; then
-  if [ -t 0 ]; then
-    say "  Get one at https://openrouter.ai/keys"
+  if ask; then
+    case "$PROVIDER" in
+      openrouter) say "  Get one at https://openrouter.ai/keys" ;;
+      openai)     say "  Get one at https://platform.openai.com/api-keys" ;;
+      groq)       say "  Get one at https://console.groq.com/keys" ;;
+      deepseek)   say "  Get one at https://platform.deepseek.com/api_keys" ;;
+      together)   say "  Get one at https://api.together.xyz/settings/api-keys" ;;
+      fireworks)  say "  Get one at https://fireworks.ai/account/api-keys" ;;
+      *)          say "  Enter the key for your endpoint" ;;
+    esac
     printf '  Paste key (input hidden): '
     stty -echo 2>/dev/null || true
     read -r API_KEY
     stty echo 2>/dev/null || true
     printf '\n'
   else
-    die "no key supplied and no TTY. Re-run with: ./install.sh --key sk-or-..."
+    die "no key supplied and no TTY. Re-run with: ./install.sh --key <key> --provider $PROVIDER"
   fi
-fi
-
-if [ -n "$API_KEY" ]; then
-  case "$API_KEY" in
-    sk-or-*) : ;;
-    *) warn "key does not start with 'sk-or-' — continuing anyway" ;;
-  esac
 fi
 
 # ---------------------------------------------------------------- install
@@ -176,8 +248,13 @@ if [ -n "$API_KEY" ]; then
   else
     umask 077
     {
-      printf 'OPENROUTER_API_KEY=%s\n' "$API_KEY"
-      printf 'LEDGER_MODEL=deepseek/deepseek-v4-flash\n'
+      printf 'LEDGER_PROVIDER=%s\n' "$PROVIDER"
+      [ -n "$MODEL" ] && printf 'LEDGER_MODEL=%s\n' "$MODEL"
+      [ -n "${LEDGER_BASE_URL:-}" ] && printf 'LEDGER_BASE_URL=%s\n' "$LEDGER_BASE_URL"
+      printf 'LEDGER_API_KEY=%s\n' "$API_KEY"
+      # Keep the OpenRouter variable populated too, so an existing setup that
+      # reads it keeps working after an upgrade.
+      [ "$PROVIDER" = "openrouter" ] && printf 'OPENROUTER_API_KEY=%s\n' "$API_KEY"
     } > "$ENV_FILE"
     chmod 600 "$ENV_FILE"
     say "  wrote $ENV_FILE (mode 600)"
@@ -207,6 +284,13 @@ if [ "$DRY_RUN" -eq 1 ]; then
   say "  [dry-run] would run: $DEST/inspect.sh caps"
 else
   "$DEST/inspect.sh" caps || warn "caps report failed (not fatal)"
+fi
+
+step "What this will cost you"
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "  [dry-run] would run: $DEST/inspect.sh cost"
+else
+  "$DEST/inspect.sh" cost || warn "cost report failed (not fatal)"
 fi
 
 cat <<'DONE'

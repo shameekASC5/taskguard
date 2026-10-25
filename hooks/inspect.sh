@@ -5,6 +5,7 @@
 #   ./inspect.sh ledger    # current open items (default)
 #   ./inspect.sh doctor    # health check: key, model, extraction smoke test
 #   ./inspect.sh caps      # are the input caps right for YOUR history?
+#   ./inspect.sh cost      # what will this cost you per turn and per session?
 #   ./inspect.sh events    # which hook events have fired (needs probe enabled)
 #   ./inspect.sh log       # raw probe log
 #   ./inspect.sh clear     # wipe probe log + ledgers
@@ -77,6 +78,9 @@ case "${1:-ledger}" in
     ;;
   caps)
     node "$DIR/caps-report.cjs" "${@:2}"
+    ;;
+  cost)
+    node "$DIR/cost-report.cjs" "${@:2}"
     ;;
   events)
     if [ ! -f "$PROBE" ]; then
@@ -179,7 +183,7 @@ case "${1:-ledger}" in
     echo "Cleared probe log, hook trace, and ledgers."
     ;;
   *)
-    echo "Usage: $0 {ledger|doctor|caps|events|trace|log|clear}"
+    echo "Usage: $0 {ledger|doctor|caps|cost|events|trace|log|clear}"
     exit 1
     ;;
 esac

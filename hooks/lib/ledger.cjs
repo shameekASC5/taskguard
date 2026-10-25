@@ -120,16 +120,115 @@ function openItems(ledger) {
  * @param {object} ledger
  * @param {Array<{kind: string, text: string}>} extracted
  */
+/**
+ * Duplicate detection for extracted items.
+ *
+ * The extractor is an LLM, so the same request re-extracted in a later turn
+ * comes back paraphrased ("Create a Git repo..." vs "Create a git repository
+ * ..."). Exact-text dedupe misses that and the ledger grows duplicates.
+ *
+ * Jaccard similarity was tried and rejected: it scores a real paraphrase
+ * ("Make the repo public and safe for others to use" vs "...for others") at
+ * 0.50, the same as two genuinely different asks ("Fix the login bug" vs
+ * "Fix the logout bug"). It cannot separate the two cases.
+ *
+ * Instead we use containment: what fraction of the SHORTER item's meaningful
+ * words appear in the longer one. A paraphrase is usually a subset of the
+ * original, so containment is high; two different asks differ in their
+ * distinguishing word, so containment stays low.
+ */
+const CONTAINMENT_THRESHOLD = 0.85;
+
+const STOPWORDS = new Set([
+  'a', 'an', 'the', 'and', 'or', 'but', 'to', 'of', 'for', 'in', 'on', 'at',
+  'by', 'with', 'from', 'as', 'is', 'are', 'be', 'been', 'it', 'its', 'this',
+  'that', 'these', 'those', 'i', 'we', 'you', 'me', 'my', 'our', 'your',
+  'please', 'also', 'then', 'so', 'if', 'can', 'could', 'would', 'should',
+  'make', 'sure', 'ensure', 'need', 'want', 'like', 'just', 'some', 'any',
+  'use', 'using', 'do', 'does', 'get', 'got',
+]);
+
+/** Common abbreviations the extractor flips between. */
+const SYNONYMS = new Map([
+  ['repo', 'repository'],
+  ['repos', 'repository'],
+  ['dir', 'directory'],
+  ['dirs', 'directory'],
+  ['config', 'configuration'],
+  ['env', 'environment'],
+  ['doc', 'documentation'],
+  ['docs', 'documentation'],
+  ['db', 'database'],
+  ['auth', 'authentication'],
+  ['info', 'information'],
+  ['msg', 'message'],
+  ['msgs', 'message'],
+  ['fn', 'function'],
+  ['func', 'function'],
+  ['param', 'parameter'],
+  ['params', 'parameter'],
+  ['arg', 'argument'],
+  ['args', 'argument'],
+  ['impl', 'implementation'],
+  ['test', 'test'],
+  ['tests', 'test'],
+]);
+
+/** Crude but effective singularisation: paths -> path, repositories -> repository. */
+function stem(word) {
+  if (word.length > 4 && word.endsWith('ies')) return `${word.slice(0, -3)}y`;
+  if (word.length > 4 && word.endsWith('es')) return word.slice(0, -2);
+  if (word.length > 3 && word.endsWith('s') && !word.endsWith('ss')) return word.slice(0, -1);
+  return word;
+}
+
+/** Meaningful tokens of a text: lowercased, synonym-mapped, stemmed, stopwords removed. */
+function tokens(text) {
+  return new Set(
+    String(text || '')
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w && !STOPWORDS.has(w))
+      .map((w) => SYNONYMS.get(w) || w)
+      .map(stem)
+      .filter(Boolean),
+  );
+}
+
+/**
+ * Containment: fraction of the smaller token set found in the larger.
+ * Returns 0..1. Symmetric, so argument order does not matter.
+ */
+function containment(a, b) {
+  if (!a.size || !b.size) return 0;
+  const [small, large] = a.size <= b.size ? [a, b] : [b, a];
+  let shared = 0;
+  for (const t of small) if (large.has(t)) shared += 1;
+  return shared / small.size;
+}
+
 function mergeExtracted(ledger, extracted) {
   const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 ]/g, '').trim();
 
   const existing = new Set(ledger.items.map((i) => norm(i.text)));
+  const existingTokens = ledger.items.map((i) => tokens(i.text));
   let counter = ledger.items.length;
 
   for (const item of extracted || []) {
     const text = String(item.text || '').trim();
     if (!text) continue;
     if (existing.has(norm(text))) continue;
+
+    // Paraphrase guard: skip if this is close enough to something we already
+    // track. Only compare against items that are still open — a resolved item
+    // that the user asks about again is a genuinely new ask.
+    const candidate = tokens(text);
+    const isDuplicate = ledger.items.some((existingItem, idx) => {
+      if (existingItem.status !== 'open') return false;
+      return containment(candidate, existingTokens[idx]) >= CONTAINMENT_THRESHOLD;
+    });
+    if (isDuplicate) continue;
 
     counter += 1;
     const kind = item.kind === 'question' ? 'question' : 'task';
@@ -143,6 +242,7 @@ function mergeExtracted(ledger, extracted) {
       note: null,
     });
     existing.add(norm(text));
+    existingTokens.push(candidate);
   }
   return ledger;
 }

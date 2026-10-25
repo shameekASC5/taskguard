@@ -15,8 +15,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { spawnSync, spawn } = require('node:child_process');
 
-const HOOKS_DIR = path.join(__dirname, '..', 'hooks');
-const ledger = require('../hooks/lib/ledger.cjs');
+const ADAPTER_DIR = path.join(__dirname, '..', 'adapters', 'vscode');
+const ledger = require('../core/ledger.cjs');
 
 /**
  * Start the stub LLM server as a SEPARATE process.
@@ -45,7 +45,7 @@ function startStubServer(payload) {
 
 /** Run a hook script with an event on stdin. */
 function runHook(script, event, env = {}) {
-  const res = spawnSync('node', [path.join(HOOKS_DIR, script)], {
+  const res = spawnSync('node', [path.join(ADAPTER_DIR, script)], {
     input: JSON.stringify(event),
     encoding: 'utf8',
     env: { ...process.env, ...env },
@@ -90,7 +90,7 @@ describe('hook scripts (end-to-end)', () => {
 
   test('ledger-extract pulls items from the prompt and writes the ledger', () => {
     const sessionId = `extract-${Date.now()}`;
-    const { stdout } = runHook('ledger-extract.cjs', {
+    const { stdout } = runHook('prompt-submitted.cjs', {
       hook_event_name: 'UserPromptSubmit',
       session_id: sessionId,
       prompt: 'What is the deploy command? Also fix the login bug.',
@@ -107,7 +107,7 @@ describe('hook scripts (end-to-end)', () => {
 
   test('ledger-extract ignores system/notification noise', () => {
     const sessionId = `extract-noise-${Date.now()}`;
-    runHook('ledger-extract.cjs', {
+    runHook('prompt-submitted.cjs', {
       hook_event_name: 'UserPromptSubmit',
       session_id: sessionId,
       prompt: '[Terminal abc notification: command completed.]',
@@ -126,7 +126,7 @@ describe('hook scripts (end-to-end)', () => {
     led.blockCount = 3;
     ledger.save(led);
 
-    runHook('ledger-extract.cjs', {
+    runHook('prompt-submitted.cjs', {
       hook_event_name: 'UserPromptSubmit',
       session_id: sessionId,
       prompt: 'A brand new request that should re-arm the enforcer.',
@@ -143,7 +143,7 @@ describe('hook scripts (end-to-end)', () => {
     ledger.mergeExtracted(led, [{ kind: 'task', text: 'carried-over session task' }]);
     ledger.save(led);
 
-    const { stdout } = runHook('ledger-session.cjs', {
+    const { stdout } = runHook('session.cjs', {
       hook_event_name: 'SessionStart',
       session_id: sessionId,
     }, stubEnv());
@@ -159,7 +159,7 @@ describe('hook scripts (end-to-end)', () => {
     ledger.mergeExtracted(led, [{ kind: 'task', text: 'inject-visible-task' }]);
     ledger.save(led);
 
-    const first = JSON.parse(runHook('ledger-inject.cjs', {
+    const first = JSON.parse(runHook('before-tool.cjs', {
       hook_event_name: 'PreToolUse',
       session_id: sessionId,
     }, stubEnv()).stdout);
@@ -167,7 +167,7 @@ describe('hook scripts (end-to-end)', () => {
     expect(first.hookSpecificOutput.additionalContext).toContain('inject-visible-task');
 
     // Second call in the same turn must not inject again.
-    const second = JSON.parse(runHook('ledger-inject.cjs', {
+    const second = JSON.parse(runHook('before-tool.cjs', {
       hook_event_name: 'PreToolUse',
       session_id: sessionId,
     }, stubEnv()).stdout);
@@ -178,7 +178,7 @@ describe('hook scripts (end-to-end)', () => {
 
   test('ledger-inject stays silent when nothing is open', () => {
     const sessionId = `inject-empty-${Date.now()}`;
-    const { stdout } = runHook('ledger-inject.cjs', {
+    const { stdout } = runHook('before-tool.cjs', {
       hook_event_name: 'PreToolUse',
       session_id: sessionId,
     }, stubEnv());
@@ -189,7 +189,7 @@ describe('hook scripts (end-to-end)', () => {
 
   test('ledger-stop allows the turn when nothing is open', () => {
     const sessionId = `stop-clean-${Date.now()}`;
-    const { stdout } = runHook('ledger-stop.cjs', {
+    const { stdout } = runHook('turn-end.cjs', {
       hook_event_name: 'Stop',
       session_id: sessionId,
     }, stubEnv());
@@ -207,7 +207,7 @@ describe('hook scripts (end-to-end)', () => {
     ledger.mergeExtracted(led, [{ kind: 'task', text: 'stop-block-unresolved-task' }]);
     ledger.save(led);
 
-    const { stdout } = runHook('ledger-stop.cjs', {
+    const { stdout } = runHook('turn-end.cjs', {
       hook_event_name: 'Stop',
       session_id: sessionId,
       stop_hook_active: false,
@@ -228,7 +228,7 @@ describe('hook scripts (end-to-end)', () => {
     ledger.mergeExtracted(led, [{ kind: 'task', text: 'stop-active-task' }]);
     ledger.save(led);
 
-    const { stdout } = runHook('ledger-stop.cjs', {
+    const { stdout } = runHook('turn-end.cjs', {
       hook_event_name: 'Stop',
       session_id: sessionId,
       stop_hook_active: true,
@@ -245,7 +245,7 @@ describe('hook scripts (end-to-end)', () => {
     led.blockCount = 3; // already at the cap
     ledger.save(led);
 
-    const { stdout } = runHook('ledger-stop.cjs', {
+    const { stdout } = runHook('turn-end.cjs', {
       hook_event_name: 'Stop',
       session_id: sessionId,
       stop_hook_active: false,
@@ -259,15 +259,15 @@ describe('hook scripts (end-to-end)', () => {
     // A hook that throws or prints garbage can wedge the editor, so this is
     // the most important contract of all.
     const scripts = [
-      'ledger-session.cjs',
-      'ledger-extract.cjs',
-      'ledger-inject.cjs',
-      'ledger-nudge.cjs',
-      'ledger-stop.cjs',
+      'session.cjs',
+      'prompt-submitted.cjs',
+      'before-tool.cjs',
+      'after-tool.cjs',
+      'turn-end.cjs',
     ];
 
     for (const script of scripts) {
-      const res = spawnSync('node', [path.join(HOOKS_DIR, script)], {
+      const res = spawnSync('node', [path.join(ADAPTER_DIR, script)], {
         input: 'not json at all',
         encoding: 'utf8',
         env: { ...process.env, ...stubEnv() },

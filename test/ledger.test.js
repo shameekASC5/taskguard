@@ -9,7 +9,7 @@
 
 const fs = require('node:fs');
 
-const ledger = require('../hooks/lib/ledger.cjs');
+const ledger = require('../core/ledger.cjs');
 
 describe('ledger store', () => {
   const sessionId = `test-${process.pid}-${Date.now()}`;

@@ -28,19 +28,19 @@ no longer needed.
 
 Five hooks, three of which never touch the network:
 
-| Event | Script | What it does | Cost |
+| Event | Adapter | What it does | Cost |
 |---|---|---|---|
-| `sessionStart` | `ledger-session.cjs` | Re-injects items carried over from a previous session | free |
-| `userPromptSubmitted` | `ledger-extract.cjs` | Extracts questions and tasks from your prompt | 1 small call |
-| `preToolUse` | `ledger-inject.cjs` | Injects the open-items list once per turn | free |
-| `postToolUse` | `ledger-nudge.cjs` | Reminds the agent mid-turn | free |
-| `agentStop` | `ledger-stop.cjs` | Audits the turn; blocks if items are unresolved | 1 small call |
+| `sessionStart` | `session.cjs` | Re-injects items carried over from a previous session | free |
+| `userPromptSubmitted` | `prompt-submitted.cjs` | Extracts questions and tasks from your prompt | 1 small call |
+| `preToolUse` | `before-tool.cjs` | Injects the open-items list once per turn | free |
+| `postToolUse` | `after-tool.cjs` | Reminds the agent mid-turn | free |
+| `agentStop` | `turn-end.cjs` | Audits the turn; blocks if items are unresolved | 1 small call |
 
 Two model calls per turn, both small and bounded. See [Cost](#cost).
 
 ### The audit is strict on purpose
 
-The `agentStop` hook sends the turn's final message to a model with a deliberately harsh prompt. It defaults to `open` when uncertain, and it rejects:
+The `turn-end` hook sends the turn's final message to a model with a deliberately harsh prompt. It defaults to `open` when uncertain, and it rejects:
 
 - promises ("I'll do that next") — a promise is not a completion
 - partial work — half a task is not a task
@@ -50,11 +50,65 @@ It must cite evidence from the response to mark something done. If it cannot, th
 
 ### It gives up eventually
 
-`MAX_BLOCKS = 3`. After three blocked turns the hook stops blocking and lets the turn through, so a stubborn disagreement cannot trap you in a loop.
+`MAX_BLOCKS = 3` per turn. After three blocked turns the hook stops blocking and lets the turn through, so a stubborn disagreement cannot trap you in a loop. The budget resets on your next prompt.
 
 ### Duplicates are collapsed
 
 The extractor is a model, so the same request re-extracted in a later turn comes back paraphrased ("Create a Git repo…" vs "Create a git repository…"). `taskguard` compares the meaningful words of each item and treats a near-subset as the same ask, so you do not get `t1`/`t5` pairs for one task. Genuinely different asks ("Fix the login bug" vs "Fix the logout bug") stay separate.
+
+## Architecture
+
+```
+core/                 framework-agnostic. Knows nothing about any harness.
+  index.cjs           the five lifecycle functions an adapter calls
+  ledger.cjs          state: load, save, merge, dedupe, prune
+  extract.cjs         the two prompts (extract, reconcile)
+  llm.cjs             provider-agnostic model client
+  trace.cjs           local trace log
+
+adapters/vscode/      thin translation only. ~250 lines, mostly comments.
+  session.cjs         sessionStart        -> onSessionStart
+  prompt-submitted.cjs userPromptSubmitted -> onPromptSubmitted
+  before-tool.cjs     preToolUse          -> onBeforeTool
+  after-tool.cjs      postToolUse         -> onAfterTool
+  turn-end.cjs        agentStop           -> onTurnEnd
+
+tools/                operator commands (inspect, caps, cost)
+```
+
+The split exists so porting is a folder, not a fork. `core/` has no `require`
+of anything harness-specific, and the adapters contain no enforcement logic —
+they read an event, call one function, and emit the harness's own output shape.
+
+## Porting to another agent framework
+
+**If you are an agent asked to port this:** read [`docs/ADAPTERS.md`](docs/ADAPTERS.md).
+It is written as a step-by-step task list with a checklist at the end.
+
+The short version:
+
+1. Find your framework's equivalent of five lifecycle moments: session start,
+   prompt submitted, before tool, after tool, and **turn end**.
+2. `cp -r adapters/vscode adapters/<yours>` and rewrite the six small files.
+3. The only hard requirement is that **turn end** can block and force another
+   turn with a reason string. Everything else is advisory.
+4. Copy `test/hook-scripts.test.js`, point `ADAPTER_DIR` at your adapter, run it.
+5. Document which lifecycle moments your harness lacks.
+
+`core/` needs no changes. If you find yourself editing it, the adapter is
+probably doing something the core should own — open an issue instead.
+
+### Frameworks this should map onto
+
+| Framework | Turn-end blocking | Notes |
+|---|---|---|
+| VS Code Copilot | yes | reference implementation |
+| Claude Code | yes | `Stop` hook with a block decision |
+| Cursor | partial | check whether hooks can force a turn |
+| Any OpenAI-compatible agent loop | yes | you own the loop, so you own the hook |
+
+If your framework cannot block at turn end, the adapter still works as a
+reminder system — say so in your README rather than implying enforcement.
 
 ## Install
 
@@ -223,7 +277,7 @@ npm install
 npm test
 ```
 
-26 tests, no network access required. The hook scripts are executed as real
+26 tests, no network access required. The adapter scripts are executed as real
 child processes with a JSON event on stdin — exactly how VS Code invokes them —
 and the model is stubbed by a local HTTP server. That covers the full contract:
 stdin parsing, ledger persistence, stdout JSON shape, and the block/nudge
@@ -231,6 +285,11 @@ decisions.
 
 CI runs the suite on Node 18/20/22 across Linux and macOS, plus a hygiene job
 that fails the build if a credential or a local machine path is ever committed.
+
+### Adding an adapter
+
+See [`docs/ADAPTERS.md`](docs/ADAPTERS.md). The core is deliberately free of
+harness knowledge so an adapter is a translation layer, not a fork.
 
 ## How state is stored
 

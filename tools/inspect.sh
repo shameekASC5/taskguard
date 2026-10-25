@@ -60,7 +60,7 @@ case "${1:-ledger}" in
     echo "--- extraction smoke test ---"
     SID="doctor-$$"
     OUT=$(echo "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$SID\",\"prompt\":\"Say hello and explain what a closure is.\"}" \
-      | node "$DIR/ledger-extract.cjs" 2>&1)
+      | node "$DIR/adapters/vscode/prompt-submitted.cjs" 2>&1)
     if [ -f "$LEDGERS/$SID.json" ]; then
       n=$(jq '.items | length' "$LEDGERS/$SID.json")
       if [ "$n" -gt 0 ]; then

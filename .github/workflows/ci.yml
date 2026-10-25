@@ -43,14 +43,21 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Syntax check every hook script
+      - name: Syntax check every script
         run: |
-          for f in hooks/*.cjs hooks/lib/*.cjs test/*.cjs; do
+          for f in core/*.cjs adapters/vscode/*.cjs tools/*.cjs test/*.cjs; do
             node --check "$f" || exit 1
           done
 
       - name: Syntax check the installer
         run: bash -n install.sh
+
+      - name: Core must not depend on any adapter
+        run: |
+          if grep -rn "adapters/" core/ ; then
+            echo "::error::core/ must not reference an adapter."
+            exit 1
+          fi
 
       - name: Fail if a real API key is committed
         run: |

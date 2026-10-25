@@ -102,9 +102,12 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 [ "$NODE_MAJOR" -ge 18 ] || die "Node.js 18+ required (found $(node -v))."
 say "  node $(node -v)"
 
-for f in ledger-session.cjs ledger-extract.cjs ledger-inject.cjs \
-         ledger-nudge.cjs ledger-stop.cjs caps-report.cjs inspect.sh; do
-  [ -f "$REPO_DIR/hooks/$f" ] || die "missing $REPO_DIR/hooks/$f — run this from the repo root."
+for f in core/index.cjs core/ledger.cjs core/extract.cjs core/llm.cjs core/trace.cjs \
+         adapters/vscode/session.cjs adapters/vscode/prompt-submitted.cjs \
+         adapters/vscode/before-tool.cjs adapters/vscode/after-tool.cjs \
+         adapters/vscode/turn-end.cjs adapters/vscode/_io.cjs \
+         tools/caps-report.cjs tools/cost-report.cjs tools/inspect.sh; do
+  [ -f "$REPO_DIR/$f" ] || die "missing $REPO_DIR/$f — run this from the repo root."
 done
 say "  hook scripts present"
 
@@ -195,15 +198,23 @@ fi
 
 # ---------------------------------------------------------------- install
 step "Installing hook scripts"
-run mkdir -p "$DEST/lib"
-for f in ledger-session.cjs ledger-extract.cjs ledger-inject.cjs \
-         ledger-nudge.cjs ledger-stop.cjs caps-report.cjs; do
-  run cp "$REPO_DIR/hooks/$f" "$DEST/$f"
+run mkdir -p "$DEST/core" "$DEST/adapters/vscode" "$DEST/tools"
+
+# Portable core: no framework knowledge, shared by every adapter.
+for f in "$REPO_DIR"/core/*.cjs; do
+  run cp "$f" "$DEST/core/$(basename "$f")"
 done
-for f in "$REPO_DIR"/hooks/lib/*.cjs; do
-  run cp "$f" "$DEST/lib/$(basename "$f")"
+
+# VS Code adapter: thin event translation only.
+for f in "$REPO_DIR"/adapters/vscode/*.cjs; do
+  run cp "$f" "$DEST/adapters/vscode/$(basename "$f")"
 done
-run cp "$REPO_DIR/hooks/inspect.sh" "$DEST/inspect.sh"
+
+# Operator tools.
+for f in caps-report.cjs cost-report.cjs; do
+  run cp "$REPO_DIR/tools/$f" "$DEST/tools/$f"
+done
+run cp "$REPO_DIR/tools/inspect.sh" "$DEST/inspect.sh"
 run chmod +x "$DEST/inspect.sh"
 say "  installed to $DEST"
 
@@ -221,19 +232,19 @@ else
   "version": 1,
   "hooks": {
     "sessionStart": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/ledger-session.cjs", "timeoutSec": 15 }
+      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/session.cjs", "timeoutSec": 15 }
     ],
     "userPromptSubmitted": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/ledger-extract.cjs", "timeoutSec": 45 }
+      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/prompt-submitted.cjs", "timeoutSec": 45 }
     ],
     "preToolUse": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/ledger-inject.cjs", "timeoutSec": 15 }
+      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/before-tool.cjs", "timeoutSec": 15 }
     ],
     "postToolUse": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/ledger-nudge.cjs", "timeoutSec": 15 }
+      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/after-tool.cjs", "timeoutSec": 15 }
     ],
     "agentStop": [
-      { "type": "command", "command": "node ~/.copilot/hooks/ledger/ledger-stop.cjs", "timeoutSec": 45 }
+      { "type": "command", "command": "node ~/.copilot/hooks/ledger/adapters/vscode/turn-end.cjs", "timeoutSec": 45 }
     ]
   }
 }

@@ -9,21 +9,55 @@
 #   ./install.sh --dry-run       # show what would happen, change nothing
 #   ./install.sh --uninstall     # remove everything this script installed
 #
+# Paths (all optional; a leading ~ is expanded):
+#   --hooks-dir DIR         where the scripts live   [~/.copilot/hooks/ledger]
+#   --config FILE           the hook config json     [~/.copilot/hooks/ledger.json]
+#   --instructions-dir DIR  where the instruction file goes
+#                                                    [~/.copilot/instructions]
+#
+# If you already have an instructions directory registered in
+# chat.instructionsFilesLocations, the installer uses that one instead of
+# creating a second. Pass --instructions-dir to override.
+#
+# The same paths can be set with TASKGUARD_HOOKS_DIR, TASKGUARD_CONFIG and
+# TASKGUARD_INSTRUCTIONS_DIR.
+#
 # What it does:
-#   1. Copies hook scripts to ~/.copilot/hooks/ledger/
-#   2. Writes ~/.copilot/hooks/ledger.json (backs up any existing one)
-#   3. Stores your OpenRouter key in ~/.copilot/hooks/ledger/.env (chmod 600)
-#   4. Installs the agent instruction file
-#   5. Runs a health check
+#   1. Copies the core, the adapter, and the tools to the hooks directory
+#   2. Writes the hook config (backs up any existing one)
+#   3. Stores your API key in <hooks-dir>/.env (chmod 600)
+#   4. Installs the agent instruction file and registers its directory
+#   5. Runs a health check, a cap check, and a cost estimate
 #
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOOKS_ROOT="$HOME/.copilot/hooks"
-DEST="$HOOKS_ROOT/ledger"
-CONFIG="$HOOKS_ROOT/ledger.json"
+
+# --- Paths -----------------------------------------------------------------
+# Every path is overridable, by flag or by environment variable. The defaults
+# match a stock VS Code install; override them if you keep your Copilot config
+# somewhere else, or if you already have an instructions directory registered
+# and would rather taskguard install into that one.
+#
+#   --hooks-dir DIR        where the scripts live      (TASKGUARD_HOOKS_DIR)
+#   --config FILE          the hook config json        (TASKGUARD_CONFIG)
+#   --instructions-dir DIR where the instruction file goes
+#                                                      (TASKGUARD_INSTRUCTIONS_DIR)
+#
+# A leading ~ is expanded, so "~/my/instructions" works.
+expand_tilde() {
+  case "$1" in
+    "~")   printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${1#\~/}" ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
+HOOKS_ROOT="$(expand_tilde "${TASKGUARD_HOOKS_ROOT:-$HOME/.copilot/hooks}")"
+DEST="$(expand_tilde "${TASKGUARD_HOOKS_DIR:-$HOOKS_ROOT/ledger}")"
+CONFIG="$(expand_tilde "${TASKGUARD_CONFIG:-$HOOKS_ROOT/ledger.json}")"
 ENV_FILE="$DEST/.env"
-INSTRUCTIONS_DIR="$HOME/.copilot/instructions"
+INSTRUCTIONS_DIR="$(expand_tilde "${TASKGUARD_INSTRUCTIONS_DIR:-$HOME/.copilot/instructions}")"
 INSTRUCTIONS_FILE="$INSTRUCTIONS_DIR/ledger.instructions.md"
 
 DRY_RUN=0
@@ -31,6 +65,8 @@ UNINSTALL=0
 API_KEY=""
 PROVIDER=""
 MODEL=""
+INSTRUCTIONS_DIR_SET=0
+[ -n "${TASKGUARD_INSTRUCTIONS_DIR:-}" ] && INSTRUCTIONS_DIR_SET=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -38,6 +74,12 @@ while [ $# -gt 0 ]; do
     --uninstall) UNINSTALL=1 ;;
     --key)       shift; API_KEY="${1:-}" ;;
     --key=*)     API_KEY="${1#--key=}" ;;
+    --hooks-dir) shift; DEST="$(expand_tilde "${1:-}")"; ENV_FILE="$DEST/.env" ;;
+    --hooks-dir=*) DEST="$(expand_tilde "${1#--hooks-dir=}")"; ENV_FILE="$DEST/.env" ;;
+    --config)    shift; CONFIG="$(expand_tilde "${1:-}")" ;;
+    --config=*)  CONFIG="$(expand_tilde "${1#--config=}")" ;;
+    --instructions-dir) shift; INSTRUCTIONS_DIR="$(expand_tilde "${1:-}")"; INSTRUCTIONS_DIR_SET=1 ;;
+    --instructions-dir=*) INSTRUCTIONS_DIR="$(expand_tilde "${1#--instructions-dir=}")"; INSTRUCTIONS_DIR_SET=1 ;;
     --provider)  shift; PROVIDER="${1:-}" ;;
     --provider=*) PROVIDER="${1#--provider=}" ;;
     --model)     shift; MODEL="${1:-}" ;;
@@ -53,6 +95,11 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# Derived paths must be recomputed AFTER flag parsing, otherwise
+# --instructions-dir / --hooks-dir would be silently ignored.
+INSTRUCTIONS_FILE="$INSTRUCTIONS_DIR/ledger.instructions.md"
+ENV_FILE="$DEST/.env"
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
@@ -273,6 +320,57 @@ if [ -n "$API_KEY" ]; then
 fi
 
 step "Installing agent instructions"
+
+# If the user already has an instructions directory registered with VS Code,
+# install there instead of creating a second one. Two registered directories
+# work, but it is confusing to have the file in a place the user does not
+# think of as "their" instructions folder.
+find_settings_file() {
+  for s in \
+    "$HOME/Library/Application Support/Code/User/settings.json" \
+    "$HOME/.config/Code/User/settings.json" \
+    "$HOME/AppData/Roaming/Code/User/settings.json"; do
+    [ -f "$s" ] && { printf '%s' "$s"; return 0; }
+  done
+  return 1
+}
+
+# Print the first registered instructions directory, if any.
+first_registered_instructions_dir() {
+  local settings="$1"
+  [ -f "$settings" ] || return 1
+  python3 - "$settings" <<'PY' 2>/dev/null
+import json, re, sys
+raw = open(sys.argv[1], encoding='utf-8').read()
+s = re.sub(r'^\s*//.*$', '', raw, flags=re.M)
+s = re.sub(r',(\s*[}\]])', r'\1', s)
+try:
+    data = json.loads(s) if s.strip() else {}
+except Exception:
+    sys.exit(1)
+locs = data.get('chat.instructionsFilesLocations') or {}
+for k in locs:
+    if locs[k]:
+        print(k)
+        break
+PY
+}
+
+if [ "$INSTRUCTIONS_DIR_SET" -eq 0 ]; then
+  if SETTINGS="$(find_settings_file)"; then
+    EXISTING="$(first_registered_instructions_dir "$SETTINGS" || true)"
+    if [ -n "$EXISTING" ]; then
+      EXISTING_EXPANDED="$(expand_tilde "$EXISTING")"
+      if [ -d "$EXISTING_EXPANDED" ]; then
+        INSTRUCTIONS_DIR="$EXISTING_EXPANDED"
+        INSTRUCTIONS_FILE="$INSTRUCTIONS_DIR/ledger.instructions.md"
+        say "  using your existing instructions directory: $EXISTING"
+        say "  (override with --instructions-dir)"
+      fi
+    fi
+  fi
+fi
+
 run mkdir -p "$INSTRUCTIONS_DIR"
 run cp "$REPO_DIR/instructions/ledger.instructions.md" "$INSTRUCTIONS_FILE"
 say "  installed $INSTRUCTIONS_FILE"
@@ -285,13 +383,23 @@ register_instructions_dir() {
   local settings="$1"
   [ -f "$settings" ] || return 1
 
+  # The directory we actually installed into, expressed the way a user would
+  # write it in settings.json. Checking the hardcoded default here was a bug:
+  # it warned even when the real target directory was already registered.
+  local target_tilde
+  case "$INSTRUCTIONS_DIR" in
+    "$HOME"/*) target_tilde="~/${INSTRUCTIONS_DIR#"$HOME"/}" ;;
+    *)         target_tilde="$INSTRUCTIONS_DIR" ;;
+  esac
+
   if grep -q 'chat.instructionsFilesLocations' "$settings" 2>/dev/null; then
-    if grep -q '"~/.copilot/instructions"' "$settings" 2>/dev/null; then
+    if grep -qF "\"$target_tilde\"" "$settings" 2>/dev/null \
+       || grep -qF "\"$INSTRUCTIONS_DIR\"" "$settings" 2>/dev/null; then
       say "  already registered in $(basename "$(dirname "$settings")")/settings.json"
       return 0
     fi
-    warn "chat.instructionsFilesLocations exists but does not include ~/.copilot/instructions"
-    warn "  add this entry manually:  \"~/.copilot/instructions\": true"
+    warn "chat.instructionsFilesLocations exists but does not include $target_tilde"
+    warn "  add this entry manually:  \"$target_tilde\": true"
     return 1
   fi
 

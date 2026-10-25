@@ -141,6 +141,35 @@ Set `LEDGER_NONINTERACTIVE=1` to guarantee no prompt ever blocks, even if stdin 
 
 Re-running `install.sh` is safe. It backs up any existing `ledger.json` first.
 
+### Choosing where things go
+
+Every path is overridable, by flag or environment variable. A leading `~` is
+expanded.
+
+| Flag | Env var | Default |
+|---|---|---|
+| `--hooks-dir DIR` | `TASKGUARD_HOOKS_DIR` | `~/.copilot/hooks/ledger` |
+| `--config FILE` | `TASKGUARD_CONFIG` | `~/.copilot/hooks/ledger.json` |
+| `--instructions-dir DIR` | `TASKGUARD_INSTRUCTIONS_DIR` | `~/.copilot/instructions` |
+
+```bash
+# Keep everything under your own dotfiles layout
+./install.sh --hooks-dir ~/dotfiles/copilot/taskguard \
+             --config   ~/dotfiles/copilot/hooks.json
+
+# Drop the instruction file into the directory you already registered
+./install.sh --instructions-dir ~/Desktop/code/copilot-md-files/instructions
+```
+
+**If you already have an instructions directory registered** in
+`chat.instructionsFilesLocations`, the installer uses that one automatically
+instead of creating a second. It prints which directory it picked, and
+`--instructions-dir` overrides it.
+
+This matters because VS Code only loads instruction files from registered
+directories. Installing into a directory that is not registered looks
+successful but does nothing.
+
 ### Letting an agent install it
 
 Paste this into a Copilot chat:

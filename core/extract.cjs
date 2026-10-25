@@ -9,6 +9,7 @@
  */
 
 const { callJson } = require('./llm.cjs');
+const verdictCheck = require('../tools/verdict-check.cjs');
 
 const EXTRACT_SYSTEM = `You extract actionable items from a user's message to a coding agent.
 
@@ -23,33 +24,45 @@ Rules:
 - Ignore anything the user explicitly says is no longer needed.
 - If there is nothing actionable, return {"items":[]}.`;
 
-const RECONCILE_SYSTEM = `You are a strict compliance auditor. Your job is to REJECT
-insufficient work, not to give the agent credit.
+const RECONCILE_SYSTEM = `You are a compliance auditor. Your job is to decide, for each
+open item, whether the agent's response shows it was handled.
 
-You receive OPEN ITEMS and the agent's latest response text.
+You receive OPEN ITEMS and the agent's recent response text.
+
 For each item, decide:
-- "done"    — the response CONTAINS the actual deliverable.
-- "dropped" — the user or agent EXPLICITLY said it is no longer needed.
-- "open"    — everything else. This is the default.
+- "done"    — the response reports the work as completed, with a concrete result.
+- "dropped" — the user or agent explicitly said it is no longer needed.
+- "open"    — everything else.
 
 Return JSON: {"verdicts":[{"id":"...","status":"done"|"dropped"|"open","note":"short evidence"}]}
 
-STRICTNESS RULES — apply all of them:
-1. DEFAULT TO "open". If you are unsure, it is "open".
-2. A QUESTION is "done" only if the response states the actual answer.
-   Naming the topic, restating the question, or saying "I'll explain" is NOT an answer.
-3. A TASK is "done" only if the response shows the work was performed
-   (the result, the output, the file changed, the command run).
-   Describing what you are about to do is NOT completion.
-4. PROMISES ARE NOT COMPLETION. "I will", "next I'll", "let me", "I'm going to",
-   "I can do that" => "open".
-5. PARTIAL IS NOT DONE. If the item asks for N things and the response gives
-   fewer than N, it is "open".
-6. MENTIONING AN ITEM IS NOT ADDRESSING IT. If the response only references the
-   item (e.g. lists it, quotes it, says it is unfinished), that is "open".
-7. Do not infer intent or give benefit of the doubt. Judge only what is written.
-8. The "note" must cite the specific evidence, or say what is missing.
-9. Include every item id exactly once.`;
+WHAT COUNTS AS DONE
+1. A stated result counts. The response is the agent's own report; you do not
+   need to see raw tool output, file contents, or command transcripts. If it
+   says "tests pass", "committed as abc123", "installed to /path", or
+   "verified: grep found none", that is a result.
+2. A summary table or checklist that marks the item complete, with a specific
+   detail attached (a commit hash, a count, a path, a test result), is done.
+3. A QUESTION is done when the response states the answer, even briefly.
+4. A TASK is done when the response reports the outcome of doing it.
+
+WHAT DOES NOT COUNT
+5. Promises and intentions: "I will", "next I'll", "let me", "I'm going to".
+6. Describing the plan without reporting a result.
+7. Partial work: if the item asks for N things and fewer than N are reported,
+   it is "open".
+8. Merely mentioning or listing the item is not addressing it.
+9. If the response says the item is still pending, blocked, or failed, it is
+   "open".
+
+JUDGEMENT
+10. Judge the substance, not the formatting. A terse "done, 33 tests pass" is
+    as complete as a long report.
+11. Do not demand evidence the agent could not have produced in a chat reply.
+12. When genuinely ambiguous, prefer "open" — but do not invent doubt when the
+    response plainly reports a completed result.
+13. The "note" must cite the specific phrase that decided it.
+14. Include every item id exactly once.`;
 
 /**
  * @param {string} prompt
@@ -98,7 +111,21 @@ async function reconcile(open, responseText) {
   const user = `OPEN ITEMS:\n${itemsBlock}\n\nAGENT RESPONSE:\n${clipped}`;
   const out = await callJson(RECONCILE_SYSTEM, user, 30000);
   if (!out || !Array.isArray(out.verdicts)) return [];
-  return out.verdicts.filter((v) => v && typeof v.id === 'string');
+
+  // Validate before returning. A malformed payload used to be filtered down to
+  // "whatever had a string id", which silently turned a broken model response
+  // into "nothing is done" — the exact symptom of a turn being blocked with no
+  // explanation. Now the bad parts are reported and the good parts survive.
+  const report = verdictCheck.check(out, open.map((i) => i.id));
+  if (report.problems.length) {
+    console.error(`⚠️  reconcile: ${report.problems.length} problem(s) in model output`);
+    report.problems.slice(0, 5).forEach((p) => console.error(`   - ${p}`));
+  }
+  if (report.warnings.length) {
+    report.warnings.slice(0, 5).forEach((w) => console.error(`   ⚠️  ${w}`));
+  }
+
+  return report.verdicts.map((v) => ({ id: v.id, status: v.status, note: v.note }));
 }
 
 /**

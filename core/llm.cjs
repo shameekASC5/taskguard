@@ -237,15 +237,25 @@ async function callJson(system, user, timeoutMs = 30000) {
     temperature: 0,
     // Hard cap: these are tiny classification tasks. Without a cap the
     // model can ramble and bill for output tokens we never use.
-    //
-    // 512 was too low. Reasoning models spend the budget on hidden thinking
-    // before emitting any content: measured on deepseek-v4.1-flash, a
-    // 29-item prompt consumed all 512 tokens as reasoning_tokens and returned
-    // content: null with finish_reason "length". The call then failed to
-    // parse and the feature silently did nothing. 2048 leaves room for the
-    // thinking plus the JSON.
     max_tokens: Number(process.env.LEDGER_MAX_OUTPUT_TOKENS) || 2048,
   };
+
+  // Reasoning OFF by default.
+  //
+  // These are classification tasks: "is this item done, yes or no". They do
+  // not benefit from chain-of-thought, and on a reasoning model the thinking
+  // consumes the entire output budget before any content is emitted.
+  //
+  // Measured on deepseek-v4.1-flash with a 29-item audit prompt:
+  //   reasoning on  -> finish_reason "length", content null, 2048 reasoning
+  //                    tokens, 0 useful output, call fails to parse
+  //   reasoning off -> finish_reason "stop", 248 tokens, correct verdicts
+  //
+  // So this is both cheaper AND the only way the feature works at all.
+  // Set LEDGER_REASONING=1 to re-enable it.
+  if (process.env.LEDGER_REASONING !== '1') {
+    body.reasoning = { enabled: false };
+  }
   // Not every provider supports response_format; Ollama in particular can
   // reject it. The prompt already asks for JSON, and we strip fences below.
   if (provider.jsonMode) body.response_format = { type: 'json_object' };

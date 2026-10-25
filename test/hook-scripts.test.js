@@ -12,6 +12,7 @@
  */
 
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { spawnSync, spawn } = require('node:child_process');
 
@@ -253,6 +254,71 @@ describe('hook scripts (end-to-end)', () => {
 
     expect(JSON.parse(stdout)).toEqual({});
     cleanup(sessionId);
+  });
+
+  test('turn-end reads the substantive message, not a trailing stub', async () => {
+    // Regression: the Stop hook fires while the agent is still writing, so the
+    // transcript's last assistant.message can be a short preamble ("Let me
+    // check...") while the real answer is the message before it. The old
+    // parser took only the last message, so the audit saw 118 chars of
+    // preamble instead of 4,000 chars of evidence, and could never mark
+    // anything done.
+    const sessionId = `stub-${Date.now()}`;
+    const led = ledger.load(sessionId);
+    ledger.mergeExtracted(led, [{ kind: 'task', text: 'stub-detection-task' }]);
+    ledger.save(led);
+
+    const transcript = path.join(os.tmpdir(), `tg-stub-${Date.now()}.jsonl`);
+    const lines = [
+      { type: 'assistant.turn_start' },
+      { type: 'assistant.message', data: { content: 'Let me check that.' } },
+      { type: 'assistant.turn_end' },
+      { type: 'user.message', data: { content: 'go on' } },
+      { type: 'assistant.turn_start' },
+      { type: 'assistant.message', data: { content: 'Let me look at the files.' } },
+      { type: 'tool.execution_start' },
+      { type: 'tool.execution_complete' },
+      {
+        type: 'assistant.message',
+        data: {
+          content: 'Done. stub-detection-task is complete: the file was changed and 33 tests pass.',
+        },
+      },
+      { type: 'assistant.turn_end' },
+      { type: 'assistant.turn_start' },
+      // The stub the harness writes while the agent is still generating.
+      { type: 'assistant.message', data: { content: 'Let me verify.' } },
+    ];
+    fs.writeFileSync(transcript, lines.map((l) => JSON.stringify(l)).join('\n'));
+
+    // A stub that echoes back a "done" verdict for whatever it is asked about,
+    // so this test isolates the transcript parser rather than the model.
+    const echoStub = await startStubServer({
+      verdicts: [{ id: 't1', status: 'done', note: 'file changed, tests pass' }],
+    });
+
+    try {
+      const { stdout } = runHook('turn-end.cjs', {
+        hook_event_name: 'Stop',
+        session_id: sessionId,
+        transcript_path: transcript,
+        stop_hook_active: false,
+      }, {
+        LEDGER_API_KEY: 'test',
+        LEDGER_TEST_URL: echoStub.url,
+        LEDGER_ALLOW_TEST_URL: '1',
+        LEDGER_TRACE: '0',
+      });
+
+      // The audit was given the substantive text, so the item resolved and the
+      // turn was allowed.
+      expect(JSON.parse(stdout)).toEqual({});
+      expect(ledger.openItems(ledger.load(sessionId))).toHaveLength(0);
+    } finally {
+      echoStub.child.kill();
+      fs.unlinkSync(transcript);
+      cleanup(sessionId);
+    }
   });
 
   test('every hook emits valid JSON and exits 0 on malformed input', () => {

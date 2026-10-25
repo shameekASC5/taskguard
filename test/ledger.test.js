@@ -87,6 +87,87 @@ describe('ledger store', () => {
     expect(led.items).toHaveLength(4);
   });
 
+  test('mergeExtracted does NOT try to catch semantic duplicates', () => {
+    // Documented limit, not a bug. These two phrasings share almost no
+    // vocabulary ("omit the actual task details" vs "not tell what the tasks
+    // are" — only "task" overlaps), and they score LOWER than two genuinely
+    // different asks ("Add tests for ai.js" vs "Add tests for db.js").
+    // No lexical threshold separates those cases, so mergeExtracted keeps
+    // both and the model-assisted collapse pass handles it instead.
+    const led = { sessionId: 'semantic-limit-test', items: [] };
+
+    ledger.mergeExtracted(led, [
+      { kind: 'question', text: 'Does the TASKGUARD pre-tool use warning omit the actual task details?' },
+    ]);
+    ledger.mergeExtracted(led, [
+      { kind: 'question', text: 'Does the pre-tool use warning not tell what the tasks are?' },
+    ]);
+
+    expect(led.items).toHaveLength(2);
+  });
+
+  test('mergeExtracted collapses near-duplicates that share most words', () => {
+    // This IS within reach of lexical matching: same words, one dropped.
+    const led = { sessionId: 'near-dup-test', items: [] };
+
+    ledger.mergeExtracted(led, [
+      { kind: 'question', text: 'Does the pre-tool use warning omit the actual task details?' },
+    ]);
+    ledger.mergeExtracted(led, [
+      { kind: 'question', text: 'Does the pre-tool use warning omit the task details?' },
+    ]);
+
+    expect(led.items).toHaveLength(1);
+  });
+
+  test('mergeExtracted keeps identifiers distinct', () => {
+    // "Add tests for ai.js" vs "Add tests for db.js" share every word except
+    // the filename. Keeping dotted identifiers as their own token is what
+    // stops these from being merged.
+    const led = { sessionId: 'identifier-test', items: [] };
+
+    ledger.mergeExtracted(led, [
+      { kind: 'task', text: 'Add tests for ai.js' },
+      { kind: 'task', text: 'Add tests for db.js' },
+    ]);
+
+    expect(led.items).toHaveLength(2);
+  });
+
+  test('applyCollapseGroups drops duplicates and keeps the survivor', () => {
+    const led = { sessionId: 'collapse-test', items: [] };
+    ledger.mergeExtracted(led, [
+      { kind: 'question', text: 'Does the pre-tool warning omit the task details?' },
+      { kind: 'question', text: 'Does the pre-tool warning not tell what the tasks are?' },
+      { kind: 'question', text: 'Which hook performs the nudge?' },
+    ]);
+
+    const merged = ledger.applyCollapseGroups(led, [
+      { keep: led.items[0].id, merge: [led.items[1].id] },
+    ]);
+
+    expect(merged).toBe(1);
+    expect(ledger.openItems(led)).toHaveLength(2);
+    expect(led.items[1].status).toBe('dropped');
+    expect(led.items[1].note).toContain(led.items[0].id);
+  });
+
+  test('applyCollapseGroups ignores unknown ids and closed items', () => {
+    const led = { sessionId: 'collapse-guard-test', items: [] };
+    ledger.mergeExtracted(led, [
+      { kind: 'task', text: 'first collapse guard task' },
+      { kind: 'task', text: 'second collapse guard task' },
+    ]);
+    ledger.applyVerdicts(led, [{ id: led.items[1].id, status: 'done' }]);
+
+    const merged = ledger.applyCollapseGroups(led, [
+      { keep: led.items[0].id, merge: ['does-not-exist', led.items[1].id] },
+    ]);
+
+    expect(merged).toBe(0);
+    expect(led.items[1].status).toBe('done');
+  });
+
   test('mergeExtracted ignores empty text', () => {
     const led = ledger.load(sessionId);
     const before = led.items.length;
@@ -117,6 +198,37 @@ describe('ledger store', () => {
     expect(led.items[0].status).toBe('done');
     expect(led.items[0].closedAt).toBeTruthy();
     expect(led.items[0].note).toBe('evidence here');
+  });
+
+  test('applyVerdicts normalises status aliases', () => {
+    // Regression: the model returns "not_done" instead of "open". The old
+    // code only accepted the exact three words and silently ignored anything
+    // else, so items stayed open forever and the audit looked broken.
+    const led = { sessionId: 'alias-test', items: [] };
+    ledger.mergeExtracted(led, [
+      { kind: 'task', text: 'alias target one' },
+      { kind: 'task', text: 'alias target two' },
+      { kind: 'task', text: 'alias target three' },
+    ]);
+
+    ledger.applyVerdicts(led, [
+      { id: led.items[0].id, status: 'completed' },
+      { id: led.items[1].id, status: 'not_done' },
+      { id: led.items[2].id, status: 'resolved' },
+    ]);
+
+    expect(led.items[0].status).toBe('done');
+    expect(led.items[1].status).toBe('open');
+    expect(led.items[2].status).toBe('done');
+  });
+
+  test('applyVerdicts ignores a status it cannot interpret', () => {
+    const led = { sessionId: 'bad-status-test', items: [] };
+    ledger.mergeExtracted(led, [{ kind: 'task', text: 'bad status target' }]);
+
+    ledger.applyVerdicts(led, [{ id: led.items[0].id, status: 'banana' }]);
+
+    expect(led.items[0].status).toBe('open');
   });
 
   test('applyVerdicts ignores unknown ids', () => {

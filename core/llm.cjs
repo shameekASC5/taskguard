@@ -237,7 +237,14 @@ async function callJson(system, user, timeoutMs = 30000) {
     temperature: 0,
     // Hard cap: these are tiny classification tasks. Without a cap the
     // model can ramble and bill for output tokens we never use.
-    max_tokens: 512,
+    //
+    // 512 was too low. Reasoning models spend the budget on hidden thinking
+    // before emitting any content: measured on deepseek-v4.1-flash, a
+    // 29-item prompt consumed all 512 tokens as reasoning_tokens and returned
+    // content: null with finish_reason "length". The call then failed to
+    // parse and the feature silently did nothing. 2048 leaves room for the
+    // thinking plus the JSON.
+    max_tokens: Number(process.env.LEDGER_MAX_OUTPUT_TOKENS) || 2048,
   };
   // Not every provider supports response_format; Ollama in particular can
   // reject it. The prompt already asks for JSON, and we strip fences below.

@@ -101,4 +101,77 @@ async function reconcile(open, responseText) {
   return out.verdicts.filter((v) => v && typeof v.id === 'string');
 }
 
-module.exports = { extract, reconcile };
+/**
+ * Collapse semantically duplicate items.
+ *
+ * Lexical similarity cannot do this. Two phrasings of one question can share
+ * almost no vocabulary ("omit the actual task details" vs "not tell what the
+ * tasks are" — only "task" overlaps), and they score LOWER than two genuinely
+ * different asks ("Add tests for ai.js" vs "Add tests for db.js" — 0.60).
+ * No threshold separates those cases, so this needs the model.
+ *
+ * Only runs when the ledger is large enough to be worth a call. Below the
+ * threshold the lexical rules in ledger.cjs are sufficient.
+ *
+ * @param {Array} items  Open items.
+ * @returns {Promise<Array<{keep: string, merge: string[]}>>} Groups to merge.
+ */
+const COLLAPSE_SYSTEM = `You group duplicate requests. You receive a numbered list of
+open questions and tasks from one conversation.
+
+Some entries are the SAME request asked more than once, in different words.
+Your job is to find those groups.
+
+Rules:
+1. Two entries are duplicates if answering one would answer the other.
+   Wording, length, and specificity may differ.
+2. A narrower and a broader version of the same ask ARE duplicates.
+   Keep the broader one.
+3. Different subjects are NOT duplicates, even if the wording is similar.
+   "Add tests for ai.js" and "Add tests for db.js" are different.
+   "Fix the login bug" and "Fix the logout bug" are different.
+4. A question and a task are never duplicates of each other.
+5. When unsure, treat them as DIFFERENT. A missed merge is harmless; a wrong
+   merge loses a request.
+6. Only report groups with 2 or more members. Do not report singletons.
+
+Return JSON: {"groups":[{"keep":"<id>","merge":["<id>","<id>"]}]}
+"keep" is the id whose wording is clearest or broadest. "merge" lists the
+other ids in that group. Every id appears at most once across all groups.`;
+
+async function collapseDuplicates(items) {
+  if (!Array.isArray(items) || items.length < 2) return [];
+
+  const list = items.map((i) => `- id=${i.id} (${i.kind}) ${i.text}`).join('\n');
+  const out = await callJson(COLLAPSE_SYSTEM, `OPEN ITEMS:\n${list}`, 30000);
+  if (!out || !Array.isArray(out.groups)) return [];
+
+  const byId = new Map(items.map((i) => [i.id, i]));
+  const seen = new Set();
+  const groups = [];
+
+  for (const g of out.groups) {
+    if (!g || typeof g.keep !== 'string' || !Array.isArray(g.merge)) continue;
+    if (!byId.has(g.keep)) continue;
+    // Guard against a model that repeats an id across groups.
+    if (seen.has(g.keep)) continue;
+
+    const merge = g.merge.filter((id) => (
+      typeof id === 'string'
+      && id !== g.keep
+      && byId.has(id)
+      && !seen.has(id)
+      // Never merge across kinds: a question is not a task.
+      && byId.get(id).kind === byId.get(g.keep).kind
+    ));
+    if (merge.length === 0) continue;
+
+    seen.add(g.keep);
+    for (const id of merge) seen.add(id);
+    groups.push({ keep: g.keep, merge });
+  }
+
+  return groups;
+}
+
+module.exports = { extract, reconcile, collapseDuplicates };

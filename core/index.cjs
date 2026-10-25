@@ -20,9 +20,19 @@
  */
 
 const ledger = require('./ledger.cjs');
-const { extract, reconcile } = require('./extract.cjs');
+const { extract, reconcile, collapseDuplicates } = require('./extract.cjs');
 const { trace } = require('./trace.cjs');
 const llm = require('./llm.cjs');
+
+/**
+ * Collapse semantic duplicates once the ledger has this many open items.
+ *
+ * Below this, the lexical rules in ledger.cjs handle the common cases for
+ * free. Above it, the ledger is big enough that a wrong duplicate is costly
+ * (noisy nudges, and an audit that cannot resolve anything), so it is worth
+ * one extra small model call.
+ */
+const COLLAPSE_MIN_OPEN = 12;
 
 /**
  * The five lifecycle moments an adapter must map onto its harness.
@@ -100,6 +110,19 @@ async function onPromptSubmitted(sessionId, prompt) {
   ledger.mergeExtracted(led, items);
   led.injectedForTurn = false;
   led.blockCount = 0;
+
+  // Semantic dedupe, only when the ledger is big enough to justify a call.
+  // Lexical matching cannot catch rewordings that share little vocabulary,
+  // and a bloated ledger makes every nudge noisy and the audit ineffective.
+  const open = ledger.openItems(led);
+  if (open.length >= COLLAPSE_MIN_OPEN) {
+    const groups = await collapseDuplicates(open);
+    const merged = ledger.applyCollapseGroups(led, groups);
+    if (merged > 0) {
+      trace('core', 'prompt-collapsed', { sessionId, merged, openBefore: open.length });
+    }
+  }
+
   ledger.save(led);
 
   trace('core', 'prompt-extracted', { sessionId, count: items.length, total: led.items.length });

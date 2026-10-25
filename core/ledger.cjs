@@ -132,12 +132,26 @@ function openItems(ledger) {
  * 0.50, the same as two genuinely different asks ("Fix the login bug" vs
  * "Fix the logout bug"). It cannot separate the two cases.
  *
- * Instead we use containment: what fraction of the SHORTER item's meaningful
- * words appear in the longer one. A paraphrase is usually a subset of the
- * original, so containment is high; two different asks differ in their
- * distinguishing word, so containment stays low.
+ * Two rules, applied in order:
+ *
+ *   1. CONTAINMENT (>= 0.85) — one item's meaningful words are almost a
+ *      subset of the other's. Catches "repo" vs "repository" style rewording.
+ *
+ *   2. OVERLAP (>= 0.60, only for texts of 6+ meaningful words) — a looser
+ *      Jaccard, but gated on length. Short asks like "Fix the login bug" vs
+ *      "Fix the logout bug" differ by one word out of three, so a loose
+ *      threshold would merge them. Long asks differ by one word out of ten,
+ *      so the same threshold is safe and catches rewordings containment
+ *      misses ("omit the actual task details" vs "not tell what the tasks
+ *      are").
+ *
+ * The length gate is what makes the looser rule safe. Without it the ledger
+ * accumulated 29 open items for ~20 real asks, which made every nudge noisy
+ * and made the audit unable to resolve anything.
  */
 const CONTAINMENT_THRESHOLD = 0.85;
+const OVERLAP_THRESHOLD = 0.60;
+const OVERLAP_MIN_TOKENS = 6;
 
 const STOPWORDS = new Set([
   'a', 'an', 'the', 'and', 'or', 'but', 'to', 'of', 'for', 'in', 'on', 'at',
@@ -182,18 +196,27 @@ function stem(word) {
   return word;
 }
 
-/** Meaningful tokens of a text: lowercased, synonym-mapped, stemmed, stopwords removed. */
+/**
+ * Meaningful tokens of a text: lowercased, synonym-mapped, stemmed, stopwords
+ * removed.
+ *
+ * Dotted identifiers (ai.js, db.js, config.json) are kept WHOLE as well as
+ * split. This matters: "Add tests for ai.js" and "Add tests for db.js" share
+ * every word except the filename, so word-level similarity scores them at 0.75
+ * — higher than a genuine duplicate. Keeping the identifier as its own token
+ * makes the difference visible and drops that pair to 0.60.
+ */
 function tokens(text) {
-  return new Set(
-    String(text || '')
-      .toLowerCase()
-      .replace(/[^a-z0-9 ]/g, ' ')
-      .split(/\s+/)
-      .filter((w) => w && !STOPWORDS.has(w))
-      .map((w) => SYNONYMS.get(w) || w)
-      .map(stem)
-      .filter(Boolean),
-  );
+  const raw = String(text || '').toLowerCase();
+  const identifiers = raw.match(/[a-z0-9_-]+\.[a-z0-9]+/g) || [];
+  const words = raw
+    .replace(/[^a-z0-9 ]/g, ' ')
+    .split(/\s+/)
+    .filter((w) => w && !STOPWORDS.has(w))
+    .map((w) => SYNONYMS.get(w) || w)
+    .map(stem)
+    .filter(Boolean);
+  return new Set([...identifiers, ...words]);
 }
 
 /**
@@ -208,25 +231,48 @@ function containment(a, b) {
   return shared / small.size;
 }
 
+/** Jaccard overlap of two token sets, 0..1. */
+function overlap(a, b) {
+  if (!a.size || !b.size) return 0;
+  let shared = 0;
+  for (const t of a) if (b.has(t)) shared += 1;
+  return shared / (a.size + b.size - shared);
+}
+
+/**
+ * Are these two items the same ask?
+ *
+ * Only applied to OPEN items: a resolved item that the user asks about again
+ * is a genuinely new ask, not a duplicate.
+ */
+function isSameAsk(a, b) {
+  if (containment(a, b) >= CONTAINMENT_THRESHOLD) return true;
+  // The looser rule is only safe when both texts are long enough that a
+  // single differing word is not the whole distinguishing signal.
+  if (a.size >= OVERLAP_MIN_TOKENS && b.size >= OVERLAP_MIN_TOKENS) {
+    return overlap(a, b) >= OVERLAP_THRESHOLD;
+  }
+  return false;
+}
+
 function mergeExtracted(ledger, extracted) {
   const norm = (s) => String(s || '').toLowerCase().replace(/\s+/g, ' ').replace(/[^a-z0-9 ]/g, '').trim();
 
-  const existing = new Set(ledger.items.map((i) => norm(i.text)));
   const existingTokens = ledger.items.map((i) => tokens(i.text));
   let counter = ledger.items.length;
 
   for (const item of extracted || []) {
     const text = String(item.text || '').trim();
     if (!text) continue;
-    if (existing.has(norm(text))) continue;
 
-    // Paraphrase guard: skip if this is close enough to something we already
-    // track. Only compare against items that are still open — a resolved item
-    // that the user asks about again is a genuinely new ask.
     const candidate = tokens(text);
     const isDuplicate = ledger.items.some((existingItem, idx) => {
+      // Only OPEN items can absorb a new ask. A resolved item that the user
+      // asks about again is a genuinely new ask, so it must not be swallowed
+      // by the exact-text check either.
       if (existingItem.status !== 'open') return false;
-      return containment(candidate, existingTokens[idx]) >= CONTAINMENT_THRESHOLD;
+      if (norm(existingItem.text) === norm(text)) return true;
+      return isSameAsk(candidate, existingTokens[idx]);
     });
     if (isDuplicate) continue;
 
@@ -241,7 +287,6 @@ function mergeExtracted(ledger, extracted) {
       closedAt: null,
       note: null,
     });
-    existing.add(norm(text));
     existingTokens.push(candidate);
   }
   return ledger;
@@ -249,19 +294,53 @@ function mergeExtracted(ledger, extracted) {
 
 /**
  * Apply reconciliation verdicts from the LLM.
+ *
+ * The model does not always use our exact vocabulary. Observed in practice:
+ * "not_done", "completed", "resolved", "pending". An unrecognised status used
+ * to be silently ignored, which left the item open forever and made the audit
+ * look broken. Normalise the common variants instead.
+ *
  * @param {object} ledger
  * @param {Array<{id: string, status: string, note?: string}>} verdicts
  */
+const STATUS_ALIASES = new Map([
+  ['done', 'done'],
+  ['completed', 'done'],
+  ['complete', 'done'],
+  ['resolved', 'done'],
+  ['answered', 'done'],
+  ['finished', 'done'],
+  ['dropped', 'dropped'],
+  ['drop', 'dropped'],
+  ['not_needed', 'dropped'],
+  ['notneeded', 'dropped'],
+  ['obsolete', 'dropped'],
+  ['cancelled', 'dropped'],
+  ['canceled', 'dropped'],
+  ['open', 'open'],
+  ['not_done', 'open'],
+  ['notdone', 'open'],
+  ['pending', 'open'],
+  ['unresolved', 'open'],
+  ['incomplete', 'open'],
+  ['partial', 'open'],
+]);
+
+function normaliseStatus(raw) {
+  const key = String(raw || '').toLowerCase().replace(/[\s-]+/g, '_');
+  return STATUS_ALIASES.get(key) || null;
+}
+
 function applyVerdicts(ledger, verdicts) {
   const byId = new Map(ledger.items.map((i) => [i.id, i]));
   for (const v of verdicts || []) {
     const item = byId.get(v.id);
     if (!item) continue;
-    if (v.status === 'done' || v.status === 'dropped' || v.status === 'open') {
-      item.status = v.status;
-      item.closedAt = v.status === 'open' ? null : new Date().toISOString();
-      item.note = v.note ? String(v.note).slice(0, 300) : null;
-    }
+    const status = normaliseStatus(v.status);
+    if (!status) continue;
+    item.status = status;
+    item.closedAt = status === 'open' ? null : new Date().toISOString();
+    item.note = v.note ? String(v.note).slice(0, 300) : null;
   }
   return ledger;
 }
@@ -278,6 +357,37 @@ function renderNudge(ledger) {
   ].join('\n');
 }
 
+/**
+ * Apply duplicate-collapse groups from the model.
+ *
+ * The kept item absorbs the merged ones: they are marked "dropped" with a note
+ * pointing at the survivor, so the history stays auditable rather than the
+ * entries vanishing.
+ *
+ * @param {object} ledger
+ * @param {Array<{keep: string, merge: string[]}>} groups
+ * @returns {number} How many items were merged away.
+ */
+function applyCollapseGroups(ledger, groups) {
+  const byId = new Map(ledger.items.map((i) => [i.id, i]));
+  let merged = 0;
+
+  for (const g of groups || []) {
+    const keep = byId.get(g.keep);
+    if (!keep || keep.status !== 'open') continue;
+
+    for (const id of g.merge || []) {
+      const item = byId.get(id);
+      if (!item || item.status !== 'open') continue;
+      item.status = 'dropped';
+      item.closedAt = new Date().toISOString();
+      item.note = `duplicate of ${keep.id}`;
+      merged += 1;
+    }
+  }
+  return merged;
+}
+
 module.exports = {
   LEDGER_DIR,
   ledgerPath,
@@ -286,6 +396,7 @@ module.exports = {
   openItems,
   mergeExtracted,
   applyVerdicts,
+  applyCollapseGroups,
   renderNudge,
   pruneResolvedLedgers,
   isFullyResolved,

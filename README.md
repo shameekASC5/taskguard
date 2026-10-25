@@ -54,7 +54,13 @@ It must cite evidence from the response to mark something done. If it cannot, th
 
 ### Duplicates are collapsed
 
-The extractor is a model, so the same request re-extracted in a later turn comes back paraphrased ("Create a Git repo…" vs "Create a git repository…"). `taskguard` compares the meaningful words of each item and treats a near-subset as the same ask, so you do not get `t1`/`t5` pairs for one task. Genuinely different asks ("Fix the login bug" vs "Fix the logout bug") stay separate.
+The extractor is a model, so the same request re-extracted in a later turn comes back paraphrased ("Create a Git repo…" vs "Create a git repository…"). Two mechanisms handle this:
+
+**Lexical, always on.** Meaningful words are compared, with dotted identifiers (`ai.js`, `db.js`) kept whole so "Add tests for ai.js" and "Add tests for db.js" stay distinct. This catches rewordings that share most of their vocabulary, for free.
+
+**Model-assisted, when the ledger is large.** Lexical matching cannot catch a rephrasing that shares almost no vocabulary — "omit the actual task details" vs "not tell what the tasks are" share only one word, and score *lower* than two genuinely different asks. Once 12 or more items are open, one extra small call groups the semantic duplicates and keeps the broadest wording. Merged items are marked `dropped` with a note pointing at the survivor, so the history stays auditable.
+
+Without this, a long session accumulated 29 open items for ~20 real asks, which made every nudge noisy and left the audit unable to resolve anything.
 
 ## Architecture
 

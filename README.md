@@ -61,7 +61,7 @@ The extractor is a model, so the same request re-extracted in a later turn comes
 Requires **Node.js 18+** and an API key for your chosen provider.
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/taskguard.git
+git clone https://github.com/shameekASC5/taskguard.git
 cd taskguard
 ./install.sh
 ```
@@ -91,7 +91,7 @@ Re-running `install.sh` is safe. It backs up any existing `ledger.json` first.
 
 Paste this into a Copilot chat:
 
-> Clone https://github.com/YOUR-USERNAME/taskguard, read the README, and install
+> Clone https://github.com/shameekASC5/taskguard, read the README, and install
 > it. Ask me which provider and model I want and for the API key — do not invent
 > one. Run `./install.sh --key <key> --provider <p> --model <m>`, then
 > `~/.copilot/hooks/ledger/inspect.sh doctor`, and report the result.

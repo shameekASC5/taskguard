@@ -164,7 +164,7 @@ expanded.
              --config   ~/dotfiles/copilot/hooks.json
 
 # Drop the instruction file into the directory you already registered
-./install.sh --instructions-dir ~/Desktop/code/copilot-md-files/instructions
+./install.sh --instructions-dir ~/my-instructions
 ```
 
 **If you already have an instructions directory registered** in

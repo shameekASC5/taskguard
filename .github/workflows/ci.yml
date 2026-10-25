@@ -69,7 +69,17 @@ jobs:
 
       - name: Fail if a local home path is committed
         run: |
-          if grep -rInE '/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/' \
+          # Catches two shapes of personal path:
+          #   1. an absolute path under a user's home directory
+          #   2. a tilde-relative path that names a personal folder
+          #
+          # A bare tilde path is fine — the README uses those as generic
+          # examples — but naming a personal folder leaks the user's layout.
+          #
+          # NOTE: this comment deliberately avoids writing out the literal
+          # patterns, because the grep below would match its own source and
+          # fail CI on every run.
+          if grep -rInE '/Users/[A-Za-z0-9._-]+/|/home/[A-Za-z0-9._-]+/|~/(Desktop|Documents|Downloads|Projects|code)/' \
                --exclude-dir=.git --exclude-dir=node_modules \
                --exclude-dir=test .; then
             echo "::error::A local machine path is committed."

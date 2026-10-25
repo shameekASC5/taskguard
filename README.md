@@ -206,6 +206,39 @@ The default model is **`deepseek/deepseek-v4.1-flash`** — cheap, fast, and rel
 
 If you switch provider but leave an OpenRouter-style model id configured, `taskguard` warns and falls back to that provider's default rather than sending a request that is guaranteed to 404.
 
+### Reasoning is turned off, including on your own reasoning model
+
+**If you bring a reasoning model — o-series, DeepSeek-R1, QwQ, a thinking variant of anything — `taskguard` will tell it not to think, and you should leave it that way.**
+
+These are not hard problems. The two calls are:
+
+- *"Which of these sentences are questions or tasks?"*
+- *"For each item, did the response report it as done?"*
+
+Both are classification. There is no multi-step deduction to do, no plan to search, no ambiguity that more thinking resolves. Reasoning buys nothing here and costs a great deal:
+
+| | Reasoning on | Reasoning off |
+|---|---|---|
+| `finish_reason` | `length` | `stop` |
+| Output tokens | 2,048 (all reasoning) | 248 |
+| Content returned | `null` | valid JSON |
+| Result | audit silently finds nothing | correct verdicts |
+
+That is measured, not theoretical — a 29-item audit prompt on `deepseek-v4.1-flash`. The model spent the entire output budget thinking and emitted no content at all, so the call failed to parse and every item stayed open. The hook then blocked the turn with no explanation. Turning reasoning off is not an optimisation; it is the difference between the feature working and not working.
+
+`taskguard` sends the right switch for your provider automatically:
+
+| Provider | Field sent |
+|---|---|
+| OpenRouter, DeepSeek, Together, Fireworks | `reasoning: { enabled: false }` |
+| OpenAI, Groq | `reasoning_effort: "none"` |
+| Ollama | nothing — no such switch exists |
+| `custom` / unknown gateway | nothing — an unknown field can 400 the whole request |
+
+Unknown providers deliberately get no field. A strict gateway that rejects unrecognised keys would fail the request outright, and a broken hook is worse than a thinking one.
+
+To opt back in anyway, set `LEDGER_REASONING=1`. You will need to raise `LEDGER_MAX_OUTPUT_TOKENS` well above 2048, or the model will spend the budget thinking and return nothing — which is exactly the failure described above.
+
 ### Configuration
 
 All optional, all in `~/.copilot/hooks/ledger/.env`:
@@ -218,6 +251,8 @@ All optional, all in `~/.copilot/hooks/ledger/.env`:
 | `LEDGER_BASE_URL` | — | Full chat-completions URL (overrides provider) |
 | `LEDGER_MAX_PROMPT_CHARS` | `16000` | Extract input cap |
 | `LEDGER_MAX_RESPONSE_CHARS` | `12000` | Audit input cap |
+| `LEDGER_MAX_OUTPUT_TOKENS` | `2048` | Output cap per call |
+| `LEDGER_REASONING` | `0` | Set `1` to let the model think (see above) |
 | `LEDGER_PRICE_IN` | from table | USD per 1M input tokens |
 | `LEDGER_PRICE_OUT` | from table | USD per 1M output tokens |
 | `LEDGER_TRACE` | `1` | Set `0` to disable the trace log |

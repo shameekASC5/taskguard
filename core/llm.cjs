@@ -87,6 +87,39 @@ const PROVIDERS = {
 const DEFAULT_PROVIDER = 'openrouter';
 
 /**
+ * How to say "do not think about this" to each provider.
+ *
+ * There is no standard field. OpenRouter and DeepSeek accept a `reasoning`
+ * object; OpenAI and Groq accept `reasoning_effort`; Together and Fireworks
+ * take the OpenRouter-style object; Ollama has no switch at all.
+ *
+ * Sending the wrong shape is not harmless — a strict gateway can reject the
+ * whole request with a 400, which would break the hook entirely. So unknown
+ * providers get nothing, and the prompt does the work instead.
+ *
+ * @param {string} providerName
+ * @returns {object|null} fields to merge into the request body
+ */
+function reasoningOff(providerName) {
+  switch (providerName) {
+    case 'openrouter':
+    case 'deepseek':
+    case 'together':
+    case 'fireworks':
+      return { reasoning: { enabled: false } };
+    case 'openai':
+    case 'groq':
+      return { reasoning_effort: 'none' };
+    case 'ollama':
+      // No reasoning switch. Local models that think will think.
+      return null;
+    default:
+      // Unknown gateway: send nothing rather than risk a 400.
+      return null;
+  }
+}
+
+/**
  * Allow tests to point the client at a stub server.
  *
  * Guarded by LEDGER_ALLOW_TEST_URL so a stray LEDGER_TEST_URL in the
@@ -240,7 +273,7 @@ async function callJson(system, user, timeoutMs = 30000) {
     max_tokens: Number(process.env.LEDGER_MAX_OUTPUT_TOKENS) || 2048,
   };
 
-  // Reasoning OFF by default.
+  // Reasoning OFF by default, for every provider.
   //
   // These are classification tasks: "is this item done, yes or no". They do
   // not benefit from chain-of-thought, and on a reasoning model the thinking
@@ -252,9 +285,14 @@ async function callJson(system, user, timeoutMs = 30000) {
   //   reasoning off -> finish_reason "stop", 248 tokens, correct verdicts
   //
   // So this is both cheaper AND the only way the feature works at all.
-  // Set LEDGER_REASONING=1 to re-enable it.
+  //
+  // The switch is spelled differently per provider, and a provider that does
+  // not recognise a field may reject the whole request. So we send the shape
+  // that provider understands, and nothing at all where there is no known
+  // switch. Set LEDGER_REASONING=1 to opt back in.
   if (process.env.LEDGER_REASONING !== '1') {
-    body.reasoning = { enabled: false };
+    const off = reasoningOff(getProviderName());
+    if (off) Object.assign(body, off);
   }
   // Not every provider supports response_format; Ollama in particular can
   // reject it. The prompt already asks for JSON, and we strip fences below.
@@ -301,5 +339,6 @@ module.exports = {
   getModel,
   getProviderName,
   getProvider,
+  reasoningOff,
   PROVIDERS,
 };

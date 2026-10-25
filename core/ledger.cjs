@@ -102,7 +102,11 @@ function save(ledger) {
   ledger.updatedAt = new Date().toISOString();
   const p = ledgerPath(ledger.sessionId);
   const tmp = `${p}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2));
+  // Ledgers hold extracted user prompt text, so they are private to the user.
+  // Default umask gives 0644 (world-readable); 0600 matches the .env handling.
+  // The mode is set on the temp file so the rename never exposes a window
+  // where the final path exists with looser permissions.
+  fs.writeFileSync(tmp, JSON.stringify(ledger, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, p);
   // Opportunistic cleanup of other sessions' fully-resolved ledgers.
   pruneResolvedLedgers(ledger.sessionId);

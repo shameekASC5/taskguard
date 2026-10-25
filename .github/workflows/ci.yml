@@ -82,3 +82,77 @@ jobs:
             echo "::error::.env must never be committed."
             exit 1
           fi
+
+  install-smoke:
+    name: fresh install actually runs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # The unit tests run from the repo tree, so they cannot catch a file that
+      # install.sh forgets to copy. That is exactly how core/extract.cjs came to
+      # require tools/verdict-check.cjs while the installer shipped without it:
+      # every hook threw MODULE_NOT_FOUND, the adapters swallowed it and emitted
+      # {}, and extraction silently did nothing on a fresh clone.
+      #
+      # So: install into a temp dir, then run a real hook from there.
+      - name: Install into a temp directory
+        run: |
+          TMPD="$(mktemp -d)"
+          echo "TMPD=$TMPD" >> "$GITHUB_ENV"
+          LEDGER_NONINTERACTIVE=1 ./install.sh \
+            --hooks-dir "$TMPD/hooks" \
+            --config "$TMPD/ledger.json" \
+            --instructions-dir "$TMPD/instructions" \
+            --key test-key-not-real \
+            --provider openrouter
+
+      - name: Every core require resolves in the installed tree
+        run: |
+          cd "$TMPD/hooks"
+          for f in core/*.cjs adapters/vscode/*.cjs tools/*.cjs; do
+            node -e "require('./$f')" 2>&1 | grep -q "Cannot find module" \
+              && { echo "::error::$f has an unresolved require after install"; exit 1; }
+          done
+          echo "all requires resolve"
+
+      - name: A hook runs without crashing
+        run: |
+          cd "$TMPD/hooks"
+          OUT="$(echo '{"session_id":"ci-smoke","prompt":"Fix the login bug and tell me the deploy command?"}' \
+            | LEDGER_DIR="$TMPD/hooks/.ledger" \
+              LEDGER_ENV_FILE="$TMPD/hooks/.env" \
+              LEDGER_TRACE=0 \
+              node adapters/vscode/prompt-submitted.cjs 2>&1)"
+          echo "hook output: $OUT"
+          if printf '%s' "$OUT" | grep -qiE "Cannot find module|Error:"; then
+            echo "::error::the prompt hook crashed on a fresh install"
+            exit 1
+          fi
+
+      - name: The hook actually persisted a ledger
+        run: |
+          ls "$TMPD/hooks/.ledger/"*.json >/dev/null 2>&1 \
+            || { echo "::error::no ledger written — extraction did not run"; exit 1; }
+          echo "ledger written"
+
+      - name: Config points at the installed scripts
+        run: |
+          grep -q "$TMPD/hooks/adapters/vscode/session.cjs" "$TMPD/ledger.json" \
+            || { echo "::error::config does not reference the install dir (--hooks-dir ignored)"; exit 1; }
+          echo "config paths correct"
+
+      - name: Uninstall refuses to delete dangerous paths
+        run: |
+          for bad in "$HOME" / /tmp; do
+            if ./install.sh --uninstall --hooks-dir "$bad" 2>&1 | grep -q "refusing to remove"; then
+              echo "guarded: $bad"
+            else
+              echo "::error::uninstall did not refuse $bad"
+              exit 1
+            fi
+          done

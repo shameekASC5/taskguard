@@ -271,7 +271,20 @@ Two model calls per turn, both capped:
 
 Worst case is roughly **7k input + 1k output tokens per turn**. The other three hooks are local file reads and cost nothing.
 
-The extract call sends **only your prompt text** — not the conversation, not file contents, not tool output.
+### What leaves your machine
+
+Two calls per turn, and it matters what each one sends:
+
+| Call | What is sent | What is **not** sent |
+|---|---|---|
+| Extract | Your prompt text, capped at `LEDGER_MAX_PROMPT_CHARS` (16k) | Conversation history, file contents, tool output |
+| Audit | The open item list, plus up to `LEDGER_MAX_RESPONSE_CHARS` (12k) of **the agent's own reply text** | File contents, tool output, your prompt |
+
+The audit call is the one to be aware of. It sends the agent's response prose so the model can judge whether each item was addressed. That prose is written by the agent and **can quote things it saw** — a file path, an error message, a snippet of code it was discussing. It is not a transcript of your files, but it is not guaranteed to be free of them either.
+
+Nothing else leaves the machine. The other three hooks are local file reads. Ledgers are stored locally with mode `600`, and the trace log records counts and IDs only — never prompt or response text.
+
+If that is not acceptable, point `LEDGER_PROVIDER` at `ollama` and nothing leaves the machine at all.
 
 ### What that means in dollars
 

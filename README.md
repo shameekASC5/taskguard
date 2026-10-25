@@ -20,7 +20,15 @@ Turn ended with 2 unresolved item(s). Address each one or state why it is
 no longer needed.
 ```
 
-<!-- SCREENSHOT: warning banner + blocked banner, cropped to the chat panel -->
+<!--
+  SCREENSHOT SLOT — drop two cropped images into docs/images/ and uncomment:
+
+  ![Stop hook warning](docs/images/warning.png)
+  ![Turn blocked](docs/images/blocked.png)
+
+  Crop to the chat panel only. Remove: terminal contents, file paths,
+  workspace names, session titles, and any account identifiers.
+-->
 
 ## How it works
 

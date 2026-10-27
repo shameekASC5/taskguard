@@ -34,9 +34,58 @@ Five hooks, three of which never touch the network:
 | `userPromptSubmitted` | `prompt-submitted.cjs` | Extracts questions and tasks from your prompt | 1 small call |
 | `preToolUse` | `before-tool.cjs` | Injects the open-items list once per turn | free |
 | `postToolUse` | `after-tool.cjs` | Reminds the agent mid-turn | free |
-| `agentStop` | `turn-end.cjs` | Audits the turn; blocks if items are unresolved | 1 small call |
+| `agentStop` | `turn-end.cjs` | Audits the turn; blocks if items are unresolved; writes the progress journal | 2 small calls |
 
-Two model calls per turn, both small and bounded. See [Cost](#cost).
+Three model calls per turn, all small and bounded. See [Cost](#cost).
+
+### The progress journal
+
+The ledger answers *"what is still open?"*. It does not answer *"what happened
+in the last 30 minutes?"* — and on a long run that is the question you actually
+have. So every turn also appends a record to a journal you can replay:
+
+```bash
+node tools/replay.cjs --latest          # the whole session, as a timeline
+node tools/replay.cjs --latest --turns  # just the turn summaries
+node tools/replay.cjs --latest --follow # live, like tail -f
+```
+
+```
+═══ session replay ═══
+span 13:27:15 → 14:02:59 (35m44s)  turns 4  tools 9  resolved 4  blocked 2
+
+13:27:15 turn 45 ⛔ BLOCKED (1m24s) ▏████████████ 18 tools
+   Refactored the parser and added fixtures; integration tests still failing.
+   ✔ parser module extracted
+   ▲ integration suite fails on empty input
+   → fix the empty-input guard
+   open: 3 ↓1
+13:27:18   👁 read_file src/parser.js
+13:27:20   ✎ replace_string_in_file src/parser.js
+```
+
+**The summary is written by a separate model call, not by the agent.** The
+agent has its own context and an incentive to look successful; asking it to
+report on itself means asking it to grade its own homework. The summariser gets
+a fresh context and sees only three things: the items open at turn start, the
+tool calls that actually ran, and the agent's prose. It is instructed to
+**trust the tool calls over the prose** — if the agent says it ran the tests but
+no test command appears in the timeline, the report says so.
+
+**The tool timeline comes from the VS Code transcript, not from our own
+instrumentation.** The transcript already records every `tool.execution_start`
+with a real timestamp and structured arguments, so there is nothing to add and
+nothing to miss. It is also complete for turns where our hooks did not fire.
+
+**On OpenTelemetry:** VS Code does not emit OTel for Copilot agent activity —
+there is no OTLP endpoint or span stream to consume. What `taskguard` does
+instead is *emit* its journal in OTLP-compatible shape, following the GenAI
+semantic conventions (`gen_ai.tool.name`, `gen_ai.operation.name`), so the data
+can be shipped to any OTel backend rather than being a private format:
+
+```bash
+node tools/replay.cjs --latest --otlp > spans.json
+```
 
 ### The audit is strict on purpose
 
@@ -262,23 +311,36 @@ The `.env` file wins over shell environment variables, so a stale exported key c
 
 ## Cost
 
-Two model calls per turn, both capped:
+Three model calls per turn, all capped:
 
 | Call | Input cap | Output cap |
 |---|---|---|
 | Extract | 16,000 chars (~4k tokens) | 512 tokens |
 | Audit | 12,000 chars (~3k tokens) | 512 tokens |
+| Progress summary | 12,000 chars (~3k tokens) | 512 tokens |
 
-Worst case is roughly **7k input + 1k output tokens per turn**. The other three hooks are local file reads and cost nothing.
+Worst case is roughly **10k input + 1.5k output tokens per turn**. The other
+three hooks are local file reads and cost nothing.
+
+The summary call is the newest addition and the reason the figure moved from
+two calls to three. It is the largest input of the three because it includes
+the turn's tool timeline, but its output is small and capped like the others.
+On `deepseek-v4.1-flash` the difference is roughly **$0.0002 per turn** — about
+a cent per 50 turns. Run `inspect.sh cost` for numbers against your own history.
+
+If you would rather not pay it, set `LEDGER_JOURNAL=0` to keep the ledger and
+the audit but skip the progress summary. The tool timeline is still recorded,
+because it comes from the transcript and costs nothing.
 
 ### What leaves your machine
 
-Two calls per turn, and it matters what each one sends:
+Three calls per turn, and it matters what each one sends:
 
 | Call | What is sent | What is **not** sent |
 |---|---|---|
 | Extract | Your prompt text, capped at `LEDGER_MAX_PROMPT_CHARS` (16k) | Conversation history, file contents, tool output |
 | Audit | The open item list, plus up to `LEDGER_MAX_RESPONSE_CHARS` (12k) of **the agent's own reply text** | File contents, tool output, your prompt |
+| Progress summary | The open item list, the turn's **tool names and derived intents** (e.g. `run_in_terminal: npm test`), and the agent's reply text | Full tool arguments, file contents, your prompt |
 
 The audit call is the one to be aware of. It sends the agent's response prose so the model can judge whether each item was addressed. That prose is written by the agent and **can quote things it saw** — a file path, an error message, a snippet of code it was discussing. It is not a transcript of your files, but it is not guaranteed to be free of them either.
 

@@ -20,9 +20,10 @@
  */
 
 const ledger = require('./ledger.cjs');
-const { extract, reconcile, collapseDuplicates } = require('./extract.cjs');
+const { extract, reconcile, collapseDuplicates, summariseTurn } = require('./extract.cjs');
 const { trace } = require('./trace.cjs');
 const llm = require('./llm.cjs');
+const journal = require('./journal.cjs');
 
 /**
  * Collapse semantic duplicates once the ledger has this many open items.
@@ -181,7 +182,27 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
   const led = ledger.load(sessionId);
   const open = ledger.openItems(led);
 
+  // Derive this turn's tool timeline from the transcript, if we have one.
+  //
+  // The transcript is the source of truth for what actually ran. We use it
+  // rather than our own PreToolUse records because the harness already logs
+  // every call with a real timestamp and structured arguments, and because it
+  // is complete even for turns where our hooks did not fire.
+  const turnEvidence = opts.transcriptPath
+    ? lastTurnEvidence(opts.transcriptPath)
+    : { tools: [], assistantText: String(responseText || '') };
+
   if (open.length === 0) {
+    // Record quiet turns too, otherwise the timeline has gaps and a replay
+    // cannot distinguish "nothing happened" from "we did not look".
+    journal.recordTurn(sessionId, {
+      turn: journal.turnCount(sessionId) + 1,
+      summary: 'No open items at turn start.',
+      toolCount: turnEvidence.tools.length,
+      openCount: 0,
+      resolved: 0,
+      blocked: false,
+    });
     trace('core', 'turn-end-allow', { sessionId, reason: 'no-open-items' });
     return { block: false, stillOpen: [], resolved: 0, blocks: led.blockCount || 0 };
   }
@@ -191,6 +212,9 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
 
   if (blocks > maxBlocks) {
     ledger.save(led);
+    await recordTurnReport(sessionId, open, turnEvidence, {
+      openCount: open.length, resolved: 0, blocked: false,
+    });
     trace('core', 'turn-end-allow', { sessionId, reason: 'max-blocks', blocks });
     return { block: false, stillOpen: open, resolved: 0, blocks };
   }
@@ -205,12 +229,18 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
     ledger.save(led);
     stillOpen = ledger.openItems(led);
     if (stillOpen.length === 0) {
+      await recordTurnReport(sessionId, open, turnEvidence, {
+        openCount: 0, resolved: open.length, blocked: false,
+      });
       trace('core', 'turn-end-allow', { sessionId, reason: 'all-resolved' });
       return { block: false, stillOpen: [], resolved: open.length, blocks };
     }
   }
 
   const resolved = open.length - stillOpen.length;
+  await recordTurnReport(sessionId, open, turnEvidence, {
+    openCount: stillOpen.length, resolved, blocked: true,
+  });
   trace('core', 'turn-end-block', { sessionId, blocks, stillOpen: stillOpen.length, resolved });
 
   return {
@@ -231,6 +261,70 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
   };
 }
 
+/**
+ * Pull the most recent user turn's evidence out of a transcript.
+ *
+ * Returns the tool calls and the agent's prose for that turn only. This is
+ * what makes the summary turn-scoped: we hand the summariser one turn, never
+ * the accumulated session.
+ */
+function lastTurnEvidence(transcriptPath) {
+  const entries = journal.readTranscript(transcriptPath);
+  const turns = journal.parseTurns(entries);
+  const last = turns[turns.length - 1];
+  if (!last) return { tools: [], assistantText: '' };
+  return { tools: last.tools, assistantText: last.assistantText };
+}
+
+/**
+ * Summarise the turn and append it to the journal.
+ *
+ * Runs as a separate model call with a fresh context — see SUMMARY_SYSTEM in
+ * extract.cjs for why the agent is not asked to report on itself.
+ *
+ * Never throws: a failed summary must not break enforcement.
+ */
+async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
+  // LEDGER_JOURNAL=0 keeps the ledger and the audit but skips the progress
+  // summary, which is the only part of the journal that costs a model call.
+  // The tool timeline still comes from the transcript for free.
+  if (process.env.LEDGER_JOURNAL === '0') {
+    journal.recordTurn(sessionId, {
+      turn: journal.turnCount(sessionId) + 1,
+      summary: '(journal disabled)',
+      toolCount: evidence.tools.length,
+      openCount: outcome.openCount,
+      resolved: outcome.resolved,
+      blocked: outcome.blocked,
+    });
+    return;
+  }
+
+  let report = null;
+  try {
+    report = await summariseTurn({
+      openAtStart,
+      tools: evidence.tools,
+      assistantText: evidence.assistantText,
+    });
+  } catch {
+    // Fall through with a null report; the turn is still recorded.
+  }
+
+  journal.recordTurn(sessionId, {
+    turn: journal.turnCount(sessionId) + 1,
+    summary: report?.summary || '(summary unavailable)',
+    completed: report?.completed || [],
+    blockers: report?.blockers || [],
+    next: report?.next || [],
+    files: report?.files || [],
+    toolCount: evidence.tools.length,
+    openCount: outcome.openCount,
+    resolved: outcome.resolved,
+    blocked: outcome.blocked,
+  });
+}
+
 module.exports = {
   LIFECYCLE,
   sessionIdFrom,
@@ -241,8 +335,10 @@ module.exports = {
   onTurnEnd,
   // Re-exported so adapters need only one require.
   ledger,
+  journal,
   extract,
   reconcile,
+  summariseTurn,
   trace,
   llm,
 };

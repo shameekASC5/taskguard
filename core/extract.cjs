@@ -97,6 +97,96 @@ async function extract(prompt) {
     .map((i) => ({ kind: i.kind === 'question' ? 'question' : 'task', text: i.text.trim() }));
 }
 
+// ---------------------------------------------------------------------------
+// Turn summary — the independent updater
+// ---------------------------------------------------------------------------
+
+/**
+ * The summariser is deliberately NOT the agent.
+ *
+ * The agent has its own context, its own goals, and an incentive to look
+ * successful. Asking it to write its own progress report means asking it to
+ * grade its own homework, and a model that misreports will misreport the
+ * summary too.
+ *
+ * So this runs as a separate call with a fresh context. It receives only:
+ *   - the items that were open when the turn started
+ *   - the tool calls made during the turn (name + intent)
+ *   - the agent's prose for this turn
+ *
+ * It never sees the conversation history, and it is told to trust the tool
+ * timeline over the prose when they disagree. That is the whole point: the
+ * tool calls are what actually happened, the prose is what the agent claims.
+ */
+const SUMMARY_SYSTEM = `You write a factual progress report for ONE turn of an agent session.
+
+You receive:
+  - OPEN AT TURN START: the items that were unresolved when this turn began
+  - TOOL CALLS: what the agent actually executed, in order
+  - AGENT PROSE: what the agent said it did
+
+Write a report covering ONLY this turn. Do not summarise the whole session.
+
+Return JSON:
+{
+  "summary": "2-4 sentences on what this turn actually accomplished",
+  "completed": ["concrete things finished this turn"],
+  "blockers": ["what got in the way, or empty"],
+  "next": ["what is planned next, or empty"],
+  "files": ["paths touched this turn, or empty"]
+}
+
+RULES
+1. TRUST THE TOOL CALLS OVER THE PROSE. If the agent says it ran the tests but
+   no test command appears in TOOL CALLS, it did not run the tests. Say so.
+2. Report only what the evidence shows. Do not infer, embellish, or assume.
+3. If the turn was mostly exploration, say so plainly — that is useful.
+4. If work was started but not finished, put it in "blockers" or "next".
+5. "completed" must be concrete: "added retry to fetchUser", not "made progress".
+6. If nothing was accomplished, say that. An honest empty report beats a
+   padded one.
+7. Never claim an item is done unless the evidence shows it was done.
+8. Keep "summary" under 400 characters.`;
+
+/**
+ * Summarise a single turn from evidence, not from the agent's self-report.
+ *
+ * @param {object} turn
+ * @param {Array}  turn.openAtStart   Items open when the turn began.
+ * @param {Array}  turn.tools         [{ tool, intent, ok }] from the transcript.
+ * @param {string} turn.assistantText The agent's prose for this turn.
+ * @returns {Promise<object|null>}
+ */
+async function summariseTurn(turn = {}) {
+  const items = (turn.openAtStart || [])
+    .map((i) => `- [${i.id}] (${i.kind}) ${i.text}`)
+    .join('\n') || '(none)';
+
+  const tools = (turn.tools || [])
+    .slice(0, 120)
+    .map((t) => `- ${t.tool}${t.intent ? `: ${t.intent}` : ''}${t.ok === false ? '  [FAILED]' : ''}`)
+    .join('\n') || '(none)';
+
+  const prose = String(turn.assistantText || '').slice(0, MAX_RESPONSE_CHARS);
+
+  const user = [
+    `OPEN AT TURN START:\n${items}`,
+    `TOOL CALLS (${(turn.tools || []).length}):\n${tools}`,
+    `AGENT PROSE:\n${prose}`,
+  ].join('\n\n');
+
+  const out = await callJson(SUMMARY_SYSTEM, user, 30000);
+  if (!out || typeof out !== 'object') return null;
+
+  return {
+    summary: typeof out.summary === 'string' ? out.summary : '',
+    completed: Array.isArray(out.completed) ? out.completed : [],
+    blockers: Array.isArray(out.blockers) ? out.blockers : [],
+    next: Array.isArray(out.next) ? out.next : [],
+    files: Array.isArray(out.files) ? out.files : [],
+  };
+}
+
 /**
  * @param {Array<{id:string,kind:string,text:string}>} open
  * @param {string} responseText
@@ -201,4 +291,4 @@ async function collapseDuplicates(items) {
   return groups;
 }
 
-module.exports = { extract, reconcile, collapseDuplicates };
+module.exports = { extract, reconcile, collapseDuplicates, summariseTurn };

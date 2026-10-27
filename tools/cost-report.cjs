@@ -140,20 +140,38 @@ function main() {
   const model = process.env.LEDGER_MODEL || 'deepseek/deepseek-v4.1-flash';
   const price = priceFor(model);
 
-  // Two calls per turn:
-  //   extract: prompt text in, small JSON out
-  //   audit:   response text in, small JSON out
-  const OUT_TOKENS = 512; // max_tokens cap on both calls
+  // Three calls per turn:
+  //   extract:  prompt text in, small JSON out
+  //   audit:    response text in, small JSON out
+  //   summary:  tool timeline + response text in, small JSON out
+  //
+  // The summary call is the progress journal. It is the largest input of the
+  // three because it includes the turn's tool calls, but its output is small
+  // and it is capped like the others.
+  const OUT_TOKENS = 512; // max_tokens cap on each call
+  const CALLS_PER_TURN = 3;
 
   const typicalPromptTok = Math.min(m.avgPromptChars, PROMPT_CAP) / CHARS_PER_TOKEN;
   const typicalResponseTok = Math.min(m.avgResponseChars, RESPONSE_CAP) / CHARS_PER_TOKEN;
   const worstPromptTok = PROMPT_CAP / CHARS_PER_TOKEN;
   const worstResponseTok = RESPONSE_CAP / CHARS_PER_TOKEN;
 
+  // The summary call re-reads the response text plus the tool timeline. The
+  // timeline is bounded by the same response cap, so the worst case is one
+  // extra response-sized input.
+  const typicalSummaryTok = typicalResponseTok;
+  const worstSummaryTok = worstResponseTok;
+
   const perTurn = (inTok, outTok) => ((inTok * price.in) + (outTok * price.out)) / 1e6;
 
-  const typicalPerTurn = perTurn(typicalPromptTok + typicalResponseTok, OUT_TOKENS * 2);
-  const worstPerTurn = perTurn(worstPromptTok + worstResponseTok, OUT_TOKENS * 2);
+  const typicalPerTurn = perTurn(
+    typicalPromptTok + typicalResponseTok + typicalSummaryTok,
+    OUT_TOKENS * CALLS_PER_TURN
+  );
+  const worstPerTurn = perTurn(
+    worstPromptTok + worstResponseTok + worstSummaryTok,
+    OUT_TOKENS * CALLS_PER_TURN
+  );
 
   const avgTurns = m.avgTurns || 10;
   const typicalPerSession = typicalPerTurn * avgTurns;
@@ -202,7 +220,7 @@ function main() {
     console.log('');
   }
 
-  console.log('Two extra model calls per turn (extract + audit):');
+  console.log('Three model calls per turn (extract + audit + progress summary):');
   console.log(`  typical turn:  ${usd(typicalPerTurn)}`);
   console.log(`  worst case:    ${usd(worstPerTurn)}   (both inputs at the cap)`);
   console.log('');

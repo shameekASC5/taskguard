@@ -170,6 +170,10 @@ async function main() {
   const result = await onTurnEnd(sessionId, lastAssistantText(transcriptPath), {
     maxBlocks: MAX_BLOCKS,
     forceBlock,
+    // The transcript is the evidence source for the turn summary. Core parses
+    // it to get this turn's tool calls, so the summariser can check what the
+    // agent claims against what actually ran.
+    transcriptPath,
   });
 
   if (!result.block) {

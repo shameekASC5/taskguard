@@ -166,6 +166,45 @@ function onAfterTool(sessionId) {
 }
 
 /**
+ * Build the "where to look" hint shown in chat after a turn.
+ *
+ * The problem this solves: the journal and changelog are only useful if you
+ * actually look at them, and remembering three commands per session is
+ * friction that guarantees you will not.
+ *
+ * The session id is included in every command rather than using --latest,
+ * because --latest is wrong the moment you have two sessions open — it would
+ * show whichever wrote most recently, not the one you are reading.
+ *
+ * @param {string} sessionId
+ * @param {object} stats  { turns, tools, kind, changelogPath }
+ * @returns {string}
+ */
+function renderLookHint(sessionId, stats = {}) {
+  const short = String(sessionId).slice(0, 8);
+  const tools = '~/.copilot/hooks/ledger/tools';
+
+  const lines = [
+    `TASKGUARD — session ${short} · ${stats.turns || 0} turn(s) · ${stats.tools || 0} tool call(s)`,
+  ];
+
+  if (stats.kind) lines.push(`  activity: ${stats.kind}`);
+
+  lines.push('');
+  lines.push('  Replay this session:');
+  lines.push(`    node ${tools}/replay.cjs ${sessionId}`);
+  lines.push('  Changelog:');
+  lines.push(`    node ${tools}/changelog.cjs ${sessionId}`);
+  if (stats.changelogPath) {
+    lines.push(`    ${stats.changelogPath}`);
+  }
+  lines.push('  All sessions:');
+  lines.push(`    node ${tools}/changelog.cjs --list`);
+
+  return lines.join('\n');
+}
+
+/**
  * TURN_END — audit the agent's final message and decide whether to block.
  *
  * This is the enforcement point. Everything else is advisory.
@@ -204,9 +243,15 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
       resolved: 0,
       blocked: false,
     });
-    writeChangelog(sessionId, opts.workspace);
+    const stats = writeChangelog(sessionId, opts.workspace);
     trace('core', 'turn-end-allow', { sessionId, reason: 'no-open-items' });
-    return { block: false, stillOpen: [], resolved: 0, blocks: led.blockCount || 0 };
+    return {
+      block: false,
+      stillOpen: [],
+      resolved: 0,
+      blocks: led.blockCount || 0,
+      hint: renderLookHint(sessionId, stats),
+    };
   }
 
   const blocks = (led.blockCount || 0) + 1;
@@ -214,11 +259,17 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
 
   if (blocks > maxBlocks) {
     ledger.save(led);
-    await recordTurnReport(sessionId, open, turnEvidence, {
+    const stats = await recordTurnReport(sessionId, open, turnEvidence, {
       openCount: open.length, resolved: 0, blocked: false, workspace: opts.workspace,
     });
     trace('core', 'turn-end-allow', { sessionId, reason: 'max-blocks', blocks });
-    return { block: false, stillOpen: open, resolved: 0, blocks };
+    return {
+      block: false,
+      stillOpen: open,
+      resolved: 0,
+      blocks,
+      hint: renderLookHint(sessionId, stats),
+    };
   }
 
   let stillOpen;
@@ -231,16 +282,22 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
     ledger.save(led);
     stillOpen = ledger.openItems(led);
     if (stillOpen.length === 0) {
-      await recordTurnReport(sessionId, open, turnEvidence, {
+      const stats = await recordTurnReport(sessionId, open, turnEvidence, {
         openCount: 0, resolved: open.length, blocked: false, workspace: opts.workspace,
       });
       trace('core', 'turn-end-allow', { sessionId, reason: 'all-resolved' });
-      return { block: false, stillOpen: [], resolved: open.length, blocks };
+      return {
+        block: false,
+        stillOpen: [],
+        resolved: open.length,
+        blocks,
+        hint: renderLookHint(sessionId, stats),
+      };
     }
   }
 
   const resolved = open.length - stillOpen.length;
-  await recordTurnReport(sessionId, open, turnEvidence, {
+  const stats = await recordTurnReport(sessionId, open, turnEvidence, {
     openCount: stillOpen.length, resolved, blocked: true, workspace: opts.workspace,
   });
   trace('core', 'turn-end-block', { sessionId, blocks, stillOpen: stillOpen.length, resolved });
@@ -257,6 +314,7 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
       ...stillOpen.map((i) => `  - [${i.id}] ${i.text}`),
       resolved > 0 ? `  (${resolved} resolved this turn)` : '',
     ].filter(Boolean).join('\n'),
+    hint: renderLookHint(sessionId, stats),
     stillOpen,
     resolved,
     blocks,
@@ -298,7 +356,7 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
       resolved: outcome.resolved,
       blocked: outcome.blocked,
     });
-    return;
+    return writeChangelog(sessionId, outcome.workspace);
   }
 
   let report = null;
@@ -326,7 +384,7 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
     blocked: outcome.blocked,
   });
 
-  writeChangelog(sessionId, outcome.workspace);
+  return writeChangelog(sessionId, outcome.workspace);
 }
 
 /**
@@ -340,20 +398,32 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
  * record nothing for it. The record is classified by activity instead.
  *
  * Never throws: a changelog failure must not break enforcement.
+ *
+ * @returns {{turns:number, tools:number, kind:string, changelogPath:string}}
+ *          Stats for the in-chat hint. Empty object on failure.
  */
 function writeChangelog(sessionId, workspace) {
-  if (process.env.LEDGER_CHANGELOG === '0') return;
+  if (process.env.LEDGER_CHANGELOG === '0') return {};
   try {
     const cwd = workspace || process.cwd();
-    changelog.write({
+    const turns = journal.readProgress(sessionId);
+    const tools = journal.readTelemetry(sessionId);
+    const result = changelog.write({
       sessionId,
       workspace: cwd,
       gitRoot: changelog.gitRoot(cwd),
-      turns: journal.readProgress(sessionId),
-      tools: journal.readTelemetry(sessionId),
+      turns,
+      tools,
     });
+    return {
+      turns: turns.length,
+      tools: tools.length,
+      kind: result.kind || '',
+      changelogPath: result.path || '',
+    };
   } catch {
     // Never let a changelog failure break enforcement.
+    return {};
   }
 }
 

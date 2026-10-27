@@ -181,6 +181,16 @@ async function main() {
   });
 
   if (!result.block) {
+    // The turn was allowed. Still surface where to look, because the journal
+    // and changelog are only useful if you actually open them, and remembering
+    // three commands per session is friction that guarantees you will not.
+    //
+    // systemMessage is top-level and renders to the user, so this is the one
+    // channel available on a non-blocking turn.
+    if (result.hint && process.env.LEDGER_HINT !== '0') {
+      emit({ systemMessage: result.hint });
+      return;
+    }
     emit({});
     return;
   }
@@ -191,7 +201,11 @@ async function main() {
       decision: 'block',
       reason: result.reason,
     },
-    systemMessage: result.systemMessage,
+    // On a block, the nudge is the important message, so the hint is appended
+    // rather than replacing it.
+    systemMessage: result.hint && process.env.LEDGER_HINT !== '0'
+      ? `${result.systemMessage}\n\n${result.hint}`
+      : result.systemMessage,
   });
 }
 

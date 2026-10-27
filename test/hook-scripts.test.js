@@ -222,7 +222,12 @@ describe('hook scripts (end-to-end)', () => {
       session_id: sessionId,
     }, stubEnv());
 
-    expect(JSON.parse(stdout)).toEqual({});
+    // An allowed turn now carries the "where to look" hint instead of {}.
+    // The hint is the only channel available on a non-blocking turn, and it
+    // is what makes the journal discoverable without memorising commands.
+    const out = JSON.parse(stdout);
+    expect(out.hookSpecificOutput).toBeUndefined();
+    expect(out.systemMessage).toContain('TASKGUARD');
     cleanup(sessionId);
   });
 
@@ -279,7 +284,9 @@ describe('hook scripts (end-to-end)', () => {
       stop_hook_active: false,
     }, { ...stubEnv(), LEDGER_FORCE_BLOCK: '1' });
 
-    expect(JSON.parse(stdout)).toEqual({});
+    const out = JSON.parse(stdout);
+    expect(out.hookSpecificOutput).toBeUndefined();
+    expect(out.systemMessage).toContain('TASKGUARD');
     cleanup(sessionId);
   });
 
@@ -344,7 +351,8 @@ describe('hook scripts (end-to-end)', () => {
 
       // The audit was given the substantive text, so the item resolved and the
       // turn was allowed.
-      expect(JSON.parse(stdout)).toEqual({});
+      const out = JSON.parse(stdout);
+      expect(out.hookSpecificOutput).toBeUndefined();
       expect(ledger.openItems(ledger.load(sessionId))).toHaveLength(0);
     } finally {
       echoStub.child.kill();

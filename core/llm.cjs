@@ -565,9 +565,198 @@ async function callReviewer(system, user, timeoutMs = 120000) {
   }
 }
 
+/**
+ * Call the reviewer WITH TOOLS, in a loop.
+ *
+ * This is what makes the reviewer a general-purpose verifier rather than a
+ * form-filler. It asks for a command, we run it, it reads the output, and it
+ * decides what to do next — up to maxSteps times.
+ *
+ * The loop terminates on any of:
+ *   - the model returns content with no tool calls (it is done)
+ *   - maxSteps is reached (cost guard)
+ *   - a call fails
+ *
+ * @param {string} system
+ * @param {string} user
+ * @param {object} opts
+ * @param {Array}  opts.tools      Tool definitions (OpenAI function shape).
+ * @param {Function} opts.execute  (name, args) => { ok, output }
+ * @param {number} [opts.maxSteps=8]
+ * @param {number} [opts.timeoutMs=180000]
+ * @returns {Promise<{result:any, steps:number, transcript:Array}|null>}
+ */
+async function callReviewerWithTools(system, user, opts = {}) {
+  const status = reviewerStatus();
+  if (!status.ok) {
+    process.stderr.write(`ledger: reviewer unavailable — ${status.reason}\n`);
+    return null;
+  }
+
+  const providerName = status.provider;
+  const provider = PROVIDERS[providerName];
+  const apiKey = cfg('LEDGER_REVIEW_API_KEY') || getKey();
+  if (!apiKey && provider.keyEnv !== 'OLLAMA_API_KEY') {
+    process.stderr.write(`ledger: no API key for reviewer provider "${providerName}".\n`);
+    return null;
+  }
+
+  // Honour the test override, same as getUrl(). Without this the reviewer
+  // path cannot be tested against a stub, which is how it shipped broken once.
+  const url = (process.env.LEDGER_ALLOW_TEST_URL === '1' && process.env.LEDGER_TEST_URL)
+    ? process.env.LEDGER_TEST_URL
+    : (cfg('LEDGER_REVIEW_BASE_URL') || provider.url);
+  const maxSteps = Number.isFinite(opts.maxSteps) ? opts.maxSteps : 8;
+  const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : 180000;
+  const execute = typeof opts.execute === 'function' ? opts.execute : () => ({ ok: false, output: '(no executor)' });
+
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+  const transcript = [];
+
+  for (let step = 1; step <= maxSteps; step += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+    const body = {
+      model: status.model,
+      messages,
+      temperature: 0.2,
+      max_tokens: Number(cfg('LEDGER_REVIEW_MAX_OUTPUT_TOKENS')) || 8192,
+    };
+    if (opts.tools && opts.tools.length) {
+      body.tools = opts.tools;
+      body.tool_choice = 'auto';
+    }
+    const reasoning = reviewerReasoning();
+    if (reasoning) Object.assign(body, reasoning);
+
+    let data;
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        process.stderr.write(`ledger: reviewer ${providerName} ${res.status} ${res.statusText}\n`);
+        return null;
+      }
+      data = await res.json();
+    } catch (err) {
+      process.stderr.write(`ledger: reviewer call failed: ${err.message}\n`);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const choice = data?.choices?.[0];
+    const message = choice?.message;
+    if (!message) return null;
+
+    const toolCalls = message.tool_calls || [];
+
+    // No tool calls: the model is done. Parse whatever it returned.
+    if (!toolCalls.length) {
+      const text = message.content;
+      if (!text) {
+        const reasoningTokens = data?.usage?.completion_tokens_details?.reasoning_tokens;
+        if (choice?.finish_reason === 'length') {
+          process.stderr.write(
+            `ledger: reviewer hit the output cap while reasoning `
+            + `(${reasoningTokens ?? '?'} reasoning tokens). `
+            + `Raise LEDGER_REVIEW_MAX_OUTPUT_TOKENS or lower LEDGER_REVIEW_EFFORT.\n`,
+          );
+        }
+        return null;
+      }
+      const cleaned = text.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+      try {
+        return { result: JSON.parse(cleaned), steps: step, transcript };
+      } catch (err) {
+        process.stderr.write(`ledger: reviewer returned unparseable JSON: ${err.message}\n`);
+        return null;
+      }
+    }
+
+    // Record the assistant turn, then run each requested tool.
+    messages.push({
+      role: 'assistant',
+      content: message.content || '',
+      tool_calls: toolCalls,
+    });
+
+    for (const call of toolCalls) {
+      const name = call?.function?.name || '';
+      let args = {};
+      try {
+        args = JSON.parse(call?.function?.arguments || '{}');
+      } catch {
+        args = {};
+      }
+
+      const outcome = execute(name, args);
+      transcript.push({ step, tool: name, args, ok: outcome.ok, output: outcome.output });
+
+      messages.push({
+        role: 'tool',
+        tool_call_id: call.id,
+        content: outcome.output || '(no output)',
+      });
+    }
+  }
+
+  // Ran out of steps. Ask once more for a verdict with no tools available, so
+  // a long investigation still produces findings rather than nothing.
+  process.stderr.write(`ledger: reviewer hit the ${maxSteps}-step limit; asking for a verdict\n`);
+  messages.push({
+    role: 'user',
+    content: 'You have reached the step limit. Return your findings JSON now, '
+      + 'based on the evidence you have gathered. Mark anything you could not '
+      + 'check as "unverified".',
+  });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: status.model,
+        messages,
+        temperature: 0.2,
+        max_tokens: Number(cfg('LEDGER_REVIEW_MAX_OUTPUT_TOKENS')) || 8192,
+        ...(reviewerReasoning() || {}),
+      }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) return null;
+    const cleaned = text.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+    return { result: JSON.parse(cleaned), steps: maxSteps, transcript };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 module.exports = {
   callJson,
   callReviewer,
+  callReviewerWithTools,
   getModel,
   getProviderName,
   getProvider,

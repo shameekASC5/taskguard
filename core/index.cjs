@@ -318,12 +318,11 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
       });
       trace('core', 'turn-end-allow', { sessionId, reason: 'all-resolved' });
 
-      // Scheduled review. Note this is NOT gated on "nothing is open" — that
-      // condition is true on most turns and would fire a review almost every
-      // time. The schedule is the only trigger.
+      // Review on a clean turn. Off by default because "nothing is open" is
+      // true on most turns — see shouldReview for the cost trade-off.
       const turnNumber = journal.turnCount(sessionId);
       let reviewReport = null;
-      if (shouldReview(turnNumber)) {
+      if (shouldReview(turnNumber, true)) {
         reviewReport = await runReview(sessionId, turnEvidence, {
           workspace: opts.workspace,
           turnNumber,
@@ -463,24 +462,34 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
 /**
  * Whether this turn should get an adversarial review.
  *
- * ONE trigger: every Nth turn. That is it.
+ * TWO triggers, one on by default:
  *
- * There is deliberately no "final turn" trigger, because there is no reliable
- * way to know a turn is final. The obvious candidate — "no items remain open"
- * — is not it: measured against real sessions, 85% of turns in a long session
- * end with zero open items, because the agent resolves what it was asked and
- * stops. Treating that as "final" would run a review on almost every turn,
- * which is the opposite of the cost control this is supposed to provide.
+ *   1. Every Nth turn (LEDGER_REVIEW_EVERY, default 10). Always on.
  *
- * A genuine "session ended" signal would need a quiet period (no new turn for
- * N minutes), which a Stop hook cannot observe — it only runs at the moment a
- * turn ends. So the schedule is the only honest trigger.
+ *   2. "Nothing is open" (LEDGER_REVIEW_ON_CLEAN, default OFF). When the agent
+ *      ends a turn with every item resolved, that is the moment it is claiming
+ *      completion — the highest-value review point, because that is where
+ *      overclaiming happens.
+ *
+ *      It is OFF by default because it is expensive: measured against real
+ *      sessions, 85% of turns in a long session end with zero open items, so
+ *      enabling it turns a 4-review session into a ~28-review one. That is a
+ *      legitimate choice if you have the cost tolerance and want maximum
+ *      supervision, which is why it is a flag rather than a hard no.
+ *
+ *      The trade-off is verification coverage against cost. At the default
+ *      (every 10) a 32-turn session costs ~$0.10; with this on it costs
+ *      ~$0.60. Both are cents, but one is 6x the other.
  *
  * @param {number} turnNumber  1-based turn index.
+ * @param {boolean} [clean]    True when the turn ended with nothing open.
  * @returns {boolean}
  */
-function shouldReview(turnNumber) {
+function shouldReview(turnNumber, clean = false) {
   if (process.env.LEDGER_REVIEW === '0') return false;
+
+  // Trigger 2: nothing open, opt-in.
+  if (clean && process.env.LEDGER_REVIEW_ON_CLEAN === '1') return true;
 
   const every = process.env.LEDGER_REVIEW_EVERY === undefined
     ? REVIEW_EVERY_DEFAULT

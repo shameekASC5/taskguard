@@ -52,8 +52,16 @@ function latestSession() {
   return newest.n.replace('.progress.jsonl', '');
 }
 
+/** Default cap for --list. Override with --all. */
+const LIST_LIMIT = 5000;
+
 function listIndex(opts) {
-  let records = changelog.readIndex(5000);
+  // --all reads everything. The default caps the read so a very large index
+  // does not blow up the terminal, but the cap is reported rather than silent.
+  const limit = opts.all ? Infinity : LIST_LIMIT;
+  let records = changelog.readIndex(limit);
+  const total = records.total;
+  const truncated = records.truncated;
 
   if (opts.kind) records = records.filter((r) => r.kind === opts.kind);
 
@@ -74,6 +82,9 @@ function listIndex(opts) {
 
   if (!records.length) {
     console.log(dim('No indexed sessions match.'));
+    if (truncated) {
+      console.log(dim(`(note: only the newest ${limit} of ${total} records were read — use --all)`));
+    }
     return 0;
   }
 
@@ -103,6 +114,63 @@ function listIndex(opts) {
   }, {});
   console.log('');
   console.log(dim(`${records.length} session(s): ${Object.entries(byKind).map(([k, v]) => `${k} ${v}`).join(', ')}`));
+
+  // Say so when the view is partial. A list that looks complete but is missing
+  // history is worse than one that admits it.
+  if (truncated) {
+    console.log('');
+    console.log(yellow(`⚠ showing the newest ${limit} of ${total} records`));
+    console.log(dim(`  ${total - limit} older record(s) not shown — use --all to see everything`));
+  }
+
+  return 0;
+}
+
+/**
+ * Prune the index.
+ *
+ *   --prune --keep 500     keep the newest 500 records
+ *   --prune --older-than 30d   drop records older than 30 days
+ *   --prune --dry-run      report what would go, change nothing
+ */
+function prune(opts) {
+  const keep = opts.keep === null || opts.keep === undefined ? null : Number(opts.keep);
+  const olderThanMs = opts.olderThan ? parseAge(opts.olderThan) : null;
+
+  if (opts.olderThan && olderThanMs === null) {
+    console.error(`invalid --older-than value: ${opts.olderThan} (use 30d, 24h, 60m)`);
+    return 2;
+  }
+  if (keep !== null && (!Number.isFinite(keep) || keep < 0)) {
+    console.error(`invalid --keep value: ${opts.keep} (use a non-negative integer)`);
+    return 2;
+  }
+  if (keep === null && olderThanMs === null) {
+    console.error('nothing to prune by. Pass --keep N or --older-than 30d.');
+    console.error('  --prune --keep 500          keep the newest 500 records');
+    console.error('  --prune --older-than 30d    drop records older than 30 days');
+    console.error('  --prune --dry-run           report what would go, change nothing');
+    return 2;
+  }
+
+  const result = changelog.pruneIndex({
+    keep: keep === null ? undefined : keep,
+    olderThanMs: olderThanMs === null ? undefined : olderThanMs,
+    dryRun: opts.dryRun,
+  });
+
+  if (result.removed === 0) {
+    console.log(`${green('✔')} nothing to prune — ${result.before} record(s), all kept`);
+    return 0;
+  }
+
+  const verb = result.dryRun ? 'would remove' : 'removed';
+  console.log(`${green('✔')} ${verb} ${result.removed} of ${result.before} record(s)`);
+  console.log(dim(`  ${result.after} remaining`));
+  if (result.dryRun) {
+    console.log('');
+    console.log(dim('  dry run — nothing was changed. Re-run without --dry-run to apply.'));
+  }
   return 0;
 }
 
@@ -138,20 +206,57 @@ function regenerate(sessionId) {
   return 1;
 }
 
+/** Read the value after a flag, or null. */
+function flagValue(args, name) {
+  const i = args.indexOf(name);
+  return i !== -1 && args[i + 1] !== undefined ? args[i + 1] : null;
+}
+
+function usage() {
+  console.log(`changelog — regenerate a session changelog, or query the index.
+
+  node tools/changelog.cjs --latest              regenerate the newest session
+  node tools/changelog.cjs <sessionId>           regenerate one session
+
+  node tools/changelog.cjs --list                list indexed sessions
+  node tools/changelog.cjs --list --kind code    filter by activity class
+  node tools/changelog.cjs --list --since 7d     filter by age
+  node tools/changelog.cjs --list --all          ignore the ${LIST_LIMIT}-record cap
+  node tools/changelog.cjs --list --json         machine-readable
+
+  node tools/changelog.cjs --prune --keep 500        keep the newest 500
+  node tools/changelog.cjs --prune --older-than 30d  drop records older than 30d
+  node tools/changelog.cjs --prune --dry-run         report, change nothing
+
+The index is append-only and never pruned automatically. --list reads the
+newest ${LIST_LIMIT} records by default and says so when it truncates.`);
+}
+
 function main(argv) {
   const args = argv.slice(2);
+
+  if (args.includes('--help') || args.includes('-h')) {
+    usage();
+    return 0;
+  }
 
   const opts = {
     list: args.includes('--list'),
     json: args.includes('--json'),
-    kind: args.includes('--kind') ? args[args.indexOf('--kind') + 1] : null,
-    since: args.includes('--since') ? args[args.indexOf('--since') + 1] : null,
+    all: args.includes('--all'),
+    dryRun: args.includes('--dry-run'),
+    kind: flagValue(args, '--kind'),
+    since: flagValue(args, '--since'),
+    keep: flagValue(args, '--keep'),
+    olderThan: flagValue(args, '--older-than'),
   };
 
+  if (args.includes('--prune')) return prune(opts);
   if (opts.list) return listIndex(opts);
 
-  let sessionId = args.find((a) => !a.startsWith('--')
-    && a !== opts.kind && a !== opts.since);
+  // A bare positional that is not a flag value is the session id.
+  const consumed = new Set([opts.kind, opts.since, opts.keep, opts.olderThan].filter(Boolean));
+  let sessionId = args.find((a) => !a.startsWith('--') && !consumed.has(a));
 
   if (args.includes('--latest') || !sessionId) sessionId = latestSession();
   if (!sessionId) {

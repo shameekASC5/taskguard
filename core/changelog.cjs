@@ -350,24 +350,98 @@ function write(session) {
   return { written: Boolean(filePath), path: filePath, kind };
 }
 
-/** Read the central index, newest last. */
+/**
+ * Read the central index, newest last.
+ *
+ * Returns an array for backwards compatibility, but the array carries two
+ * non-enumerable properties describing what happened:
+ *
+ *   .total      how many records exist in the file
+ *   .truncated  whether `limit` cut the result short
+ *
+ * The caller needs to know when it is seeing a partial view. Silently
+ * returning the newest N of a larger set is the same class of bug as the
+ * silent failures this project exists to prevent — the user sees a complete
+ * looking list that is missing history.
+ *
+ * @param {number} limit  Max records to return. Use Infinity for all.
+ * @returns {Array<object> & {total:number, truncated:boolean}}
+ */
 function readIndex(limit = 500) {
   let raw;
   try {
     raw = fs.readFileSync(INDEX_FILE, 'utf8');
   } catch {
-    return [];
+    const empty = [];
+    Object.defineProperties(empty, {
+      total: { value: 0, enumerable: false },
+      truncated: { value: false, enumerable: false },
+    });
+    return empty;
   }
-  const out = [];
+
+  const all = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
     try {
-      out.push(JSON.parse(line));
+      all.push(JSON.parse(line));
     } catch {
       // Skip a truncated line.
     }
   }
-  return out.length > limit ? out.slice(out.length - limit) : out;
+
+  const truncated = Number.isFinite(limit) && all.length > limit;
+  const out = truncated ? all.slice(all.length - limit) : all;
+
+  Object.defineProperties(out, {
+    total: { value: all.length, enumerable: false },
+    truncated: { value: truncated, enumerable: false },
+  });
+  return out;
+}
+
+/**
+ * Drop index records, keeping the newest `keep` (or everything newer than
+ * `olderThanMs`).
+ *
+ * Rewrites the file atomically: a crash mid-write must not leave a half
+ * written index, because that is the only cross-workspace record of what
+ * happened.
+ *
+ * @param {object} opts
+ * @param {number} [opts.keep]         Keep only the newest N records.
+ * @param {number} [opts.olderThanMs]  Drop records older than this age.
+ * @param {boolean} [opts.dryRun]      Report what would go, change nothing.
+ * @returns {{before:number, after:number, removed:number, dryRun:boolean}}
+ */
+function pruneIndex(opts = {}) {
+  const all = readIndex(Infinity);
+  const before = all.length;
+
+  let kept = all;
+  if (Number.isFinite(opts.keep) && opts.keep >= 0) {
+    kept = all.slice(Math.max(0, all.length - opts.keep));
+  }
+  if (Number.isFinite(opts.olderThanMs)) {
+    const cutoff = Date.now() - opts.olderThanMs;
+    kept = kept.filter((r) => {
+      const t = Date.parse(r.at);
+      // Keep anything with an unparseable timestamp rather than silently
+      // discarding a record we do not understand.
+      return !Number.isFinite(t) || t >= cutoff;
+    });
+  }
+
+  const removed = before - kept.length;
+
+  if (!opts.dryRun && removed > 0) {
+    const tmp = `${INDEX_FILE}.tmp`;
+    fs.mkdirSync(LEDGER_DIR, { recursive: true });
+    fs.writeFileSync(tmp, kept.length ? `${kept.map((r) => JSON.stringify(r)).join('\n')}\n` : '', { mode: 0o600 });
+    fs.renameSync(tmp, INDEX_FILE);
+  }
+
+  return { before, after: kept.length, removed, dryRun: Boolean(opts.dryRun) };
 }
 
 module.exports = {
@@ -377,6 +451,7 @@ module.exports = {
   renderMarkdown,
   write,
   readIndex,
+  pruneIndex,
   gitRoot,
   WRITE_TOOLS,
   MOVE_TOOLS,

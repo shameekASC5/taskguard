@@ -251,6 +251,147 @@ describe('changelog — writing', () => {
   });
 });
 
+describe('changelog — index reading and truncation', () => {
+  /** Seed N index records, oldest first. */
+  function seed(n) {
+    fs.mkdirSync(path.dirname(changelog.INDEX_FILE), { recursive: true });
+    const lines = [];
+    for (let i = 1; i <= n; i += 1) {
+      lines.push(JSON.stringify({
+        at: new Date(Date.now() - (n - i) * 86400000).toISOString(),
+        sessionId: `s${i}`,
+        workspace: '/ws',
+        kind: 'code',
+        turns: i,
+        tools: i * 3,
+        headlines: [`did thing ${i}`],
+        files: { written: [], read: [], moved: [] },
+        changelogPath: '',
+      }));
+    }
+    fs.writeFileSync(changelog.INDEX_FILE, `${lines.join('\n')}\n`);
+  }
+
+  test('reports the true total even when the read is capped', () => {
+    // The cap must not hide the fact that it truncated. A list that looks
+    // complete but is missing history is the bug this guards against.
+    seed(12);
+    const r = changelog.readIndex(5);
+    expect(r).toHaveLength(5);
+    expect(r.total).toBe(12);
+    expect(r.truncated).toBe(true);
+  });
+
+  test('returns everything when the limit is Infinity', () => {
+    seed(12);
+    const r = changelog.readIndex(Infinity);
+    expect(r).toHaveLength(12);
+    expect(r.truncated).toBe(false);
+  });
+
+  test('does not report truncation when the limit exceeds the total', () => {
+    seed(3);
+    const r = changelog.readIndex(500);
+    expect(r).toHaveLength(3);
+    expect(r.truncated).toBe(false);
+  });
+
+  test('a capped read returns the NEWEST records', () => {
+    seed(12);
+    const r = changelog.readIndex(3);
+    expect(r.map((x) => x.sessionId)).toEqual(['s10', 's11', 's12']);
+  });
+
+  test('an empty index reports zero, not truncation', () => {
+    const r = changelog.readIndex(5);
+    expect(r).toHaveLength(0);
+    expect(r.total).toBe(0);
+    expect(r.truncated).toBe(false);
+  });
+
+  test('total and truncated are not enumerable, so JSON output is unchanged', () => {
+    seed(3);
+    const r = changelog.readIndex(2);
+    expect(JSON.parse(JSON.stringify(r))).toHaveLength(2);
+  });
+});
+
+describe('changelog — pruning', () => {
+  function seed(n) {
+    fs.mkdirSync(path.dirname(changelog.INDEX_FILE), { recursive: true });
+    const lines = [];
+    for (let i = 1; i <= n; i += 1) {
+      lines.push(JSON.stringify({
+        at: new Date(Date.now() - (n - i) * 86400000).toISOString(),
+        sessionId: `s${i}`,
+        workspace: '/ws',
+        kind: 'code',
+        turns: 1,
+        tools: 1,
+        headlines: [],
+        files: { written: [], read: [], moved: [] },
+        changelogPath: '',
+      }));
+    }
+    fs.writeFileSync(changelog.INDEX_FILE, `${lines.join('\n')}\n`);
+  }
+
+  test('--keep retains the newest N', () => {
+    seed(12);
+    const r = changelog.pruneIndex({ keep: 5 });
+    expect(r).toMatchObject({ before: 12, after: 5, removed: 7 });
+    expect(changelog.readIndex(Infinity).map((x) => x.sessionId))
+      .toEqual(['s8', 's9', 's10', 's11', 's12']);
+  });
+
+  test('--older-than drops records past the cutoff', () => {
+    seed(12); // one per day, oldest first
+    const r = changelog.pruneIndex({ olderThanMs: 5 * 86400000 });
+    expect(r.removed).toBeGreaterThan(0);
+    expect(r.after).toBeLessThan(12);
+  });
+
+  test('dry run reports but changes nothing', () => {
+    seed(12);
+    const r = changelog.pruneIndex({ keep: 5, dryRun: true });
+    expect(r).toMatchObject({ before: 12, after: 5, removed: 7, dryRun: true });
+    expect(changelog.readIndex(Infinity)).toHaveLength(12);
+  });
+
+  test('pruning to more than exists removes nothing', () => {
+    seed(3);
+    const r = changelog.pruneIndex({ keep: 100 });
+    expect(r.removed).toBe(0);
+    expect(changelog.readIndex(Infinity)).toHaveLength(3);
+  });
+
+  test('pruning an empty index is a no-op', () => {
+    const r = changelog.pruneIndex({ keep: 5 });
+    expect(r).toMatchObject({ before: 0, after: 0, removed: 0 });
+  });
+
+  test('keeps records with an unparseable timestamp rather than guessing', () => {
+    fs.mkdirSync(path.dirname(changelog.INDEX_FILE), { recursive: true });
+    fs.writeFileSync(changelog.INDEX_FILE, [
+      JSON.stringify({ at: 'not-a-date', sessionId: 'weird', kind: 'code' }),
+      JSON.stringify({ at: new Date().toISOString(), sessionId: 'normal', kind: 'code' }),
+    ].join('\n') + '\n');
+
+    changelog.pruneIndex({ olderThanMs: 1000 });
+    const ids = changelog.readIndex(Infinity).map((x) => x.sessionId);
+    expect(ids).toContain('weird');
+  });
+
+  test('the pruned file is valid JSONL', () => {
+    seed(12);
+    changelog.pruneIndex({ keep: 5 });
+    const raw = fs.readFileSync(changelog.INDEX_FILE, 'utf8');
+    for (const line of raw.split('\n').filter(Boolean)) {
+      expect(() => JSON.parse(line)).not.toThrow();
+    }
+  });
+});
+
 describe('changelog — git integration', () => {
   test('includes branch and diff when the workspace is a repo', () => {
     const repo = path.join(tmpDir, 'repo');

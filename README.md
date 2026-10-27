@@ -266,8 +266,18 @@ automatically on every turn, so you never have to remember to run anything.
 node tools/changelog.cjs --list              # every indexed session
 node tools/changelog.cjs --list --kind code  # only code sessions
 node tools/changelog.cjs --list --since 7d   # last week
+node tools/changelog.cjs --list --all        # ignore the 5000-record cap
 node tools/changelog.cjs --latest            # regenerate the newest
+
+node tools/changelog.cjs --prune --keep 500        # keep the newest 500
+node tools/changelog.cjs --prune --older-than 30d  # drop records older than 30d
+node tools/changelog.cjs --prune --dry-run         # report, change nothing
 ```
+
+**The index is append-only and never pruned automatically.** `--list` reads the
+newest 5,000 records by default and **says so when it truncates** — a list that
+looks complete but is silently missing history is worse than one that admits
+it. Use `--all` to read everything, or `--prune` to bound the file.
 
 **A changelog is repo-shaped. Agent sessions are not.** That is the design
 problem this solves. A `git diff`-based changelog produces *nothing* for a

@@ -170,6 +170,7 @@ NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
 say "  node $(node -v)"
 
 for f in core/index.cjs core/ledger.cjs core/extract.cjs core/llm.cjs core/trace.cjs \
+         core/journal.cjs core/parsers.cjs \
          adapters/vscode/session.cjs adapters/vscode/prompt-submitted.cjs \
          adapters/vscode/before-tool.cjs adapters/vscode/after-tool.cjs \
          adapters/vscode/turn-end.cjs adapters/vscode/_io.cjs \

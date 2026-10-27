@@ -52,7 +52,7 @@ describe('journal — transcript parsing', () => {
       line('assistant.message', { content: 'done' }, '2026-10-27T10:01:01.000Z'),
     ]);
 
-    const turns = journal.parseTurns(journal.readTranscript(p));
+    const turns = journal.parseTurns(p);
     expect(turns).toHaveLength(2);
     expect(turns[0].userText).toBe('first ask');
     expect(turns[0].assistantText).toBe('working');
@@ -70,7 +70,7 @@ describe('journal — transcript parsing', () => {
       line('tool.execution_complete', { toolCallId: 'c1', success: true }, '2026-10-27T10:00:02.000Z'),
     ]);
 
-    const [turn] = journal.parseTurns(journal.readTranscript(p));
+    const [turn] = journal.parseTurns(p);
     expect(turn.tools).toHaveLength(1);
     expect(turn.tools[0].tool).toBe('run_in_terminal');
     expect(turn.tools[0].intent).toBe('npm test');
@@ -86,7 +86,7 @@ describe('journal — transcript parsing', () => {
       line('tool.execution_complete', { toolCallId: 'c1', success: false }, '2026-10-27T10:00:02.000Z'),
     ]);
 
-    const [turn] = journal.parseTurns(journal.readTranscript(p));
+    const [turn] = journal.parseTurns(p);
     expect(turn.tools[0].ok).toBe(false);
   });
 
@@ -97,7 +97,7 @@ describe('journal — transcript parsing', () => {
       line('assistant.message', { content: 'ok' }, '2026-10-27T10:00:01.000Z'),
     ]);
 
-    const turns = journal.parseTurns(journal.readTranscript(p));
+    const turns = journal.parseTurns(p);
     expect(turns).toHaveLength(1);
     expect(turns[0].assistantText).toBe('ok');
   });

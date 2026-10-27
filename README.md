@@ -153,7 +153,9 @@ Without this, a long session accumulated 29 open items for ~20 real asks, which 
 core/                 framework-agnostic. Knows nothing about any harness.
   index.cjs           the five lifecycle functions an adapter calls
   ledger.cjs          state: load, save, merge, dedupe, prune
-  extract.cjs         the two prompts (extract, reconcile)
+  extract.cjs         the three prompts (extract, reconcile, summarise)
+  journal.cjs         per-turn progress records + tool timeline
+  parsers.cjs         transcript parsers, one per harness  <- the portability seam
   llm.cjs             provider-agnostic model client
   trace.cjs           local trace log
 
@@ -164,7 +166,7 @@ adapters/vscode/      thin translation only. ~250 lines, mostly comments.
   after-tool.cjs      postToolUse         -> onAfterTool
   turn-end.cjs        agentStop           -> onTurnEnd
 
-tools/                operator commands (inspect, caps, cost)
+tools/                operator commands (inspect, caps, cost, replay)
 ```
 
 The split exists so porting is a folder, not a fork. `core/` has no `require`
@@ -176,27 +178,92 @@ they read an event, call one function, and emit the harness's own output shape.
 **If you are an agent asked to port this:** read [`docs/ADAPTERS.md`](docs/ADAPTERS.md).
 It is written as a step-by-step task list with a checklist at the end.
 
-The short version:
+There are **two** seams, and most ports only need the first.
 
-1. Find your framework's equivalent of five lifecycle moments: session start,
-   prompt submitted, before tool, after tool, and **turn end**.
-2. `cp -r adapters/vscode adapters/<yours>` and rewrite the six small files.
-3. The only hard requirement is that **turn end** can block and force another
+### Seam 1 — the adapter (required)
+
+Five lifecycle moments: session start, prompt submitted, before tool, after
+tool, and **turn end**.
+
+1. `cp -r adapters/vscode adapters/<yours>` and rewrite the six small files.
+2. The only hard requirement is that **turn end** can block and force another
    turn with a reason string. Everything else is advisory.
-4. Copy `test/hook-scripts.test.js`, point `ADAPTER_DIR` at your adapter, run it.
-5. Document which lifecycle moments your harness lacks.
+3. Copy `test/hook-scripts.test.js`, point `ADAPTER_DIR` at your adapter, run it.
+4. Document which lifecycle moments your harness lacks.
 
 `core/` needs no changes. If you find yourself editing it, the adapter is
 probably doing something the core should own — open an issue instead.
 
+### Seam 2 — the transcript parser (only if you want the journal)
+
+The progress journal needs to know what tools ran during a turn. It gets that
+from the harness's transcript, and every harness stores transcripts
+differently. So parsing lives in `core/parsers.cjs`, behind a registry.
+
+A parser is one object with one function:
+
+```js
+const mine = {
+  name: 'my-agent',
+  description: 'My agent\'s JSONL log',
+
+  parse(file) {
+    // Return the normalised shape. Return [] rather than throwing.
+    return [{
+      index: 1,                          // 1-based, in order
+      startedAt: '2026-10-27T10:00:00Z', // ISO 8601
+      endedAt:   '2026-10-27T10:01:00Z',
+      userText: 'what the human asked',
+      assistantText: 'what the agent said',
+      tools: [{
+        tool: 'run_in_terminal',         // tool name
+        intent: 'npm test',              // short human-readable summary
+        at: '2026-10-27T10:00:30Z',      // ISO 8601
+        ok: true,                        // did it succeed
+      }],
+    }];
+  },
+};
+
+// core/parsers.cjs
+const PARSERS = {
+  [vscode.name]: vscode,
+  [openaiMessages.name]: openaiMessages,
+  [mine.name]: mine,          // <- add yours
+};
+```
+
+Then either pass it explicitly or let auto-detection find it:
+
+```js
+journal.parseTurns(path, 'my-agent');   // explicit
+journal.parseTurns(path);               // sniffed from the file contents
+```
+
+**Two parsers ship today:**
+
+| Parser | Format | Covers |
+|---|---|---|
+| `vscode` | JSONL with `type: "user.message"` / `"tool.execution_start"` | VS Code Copilot Chat |
+| `openai-messages` | JSON array or JSONL of `{role, content, tool_calls}` | LangChain, LlamaIndex, OpenAI SDK, most homegrown loops |
+
+Auto-detection sniffs the first 4 KB and picks the shape that fits, so in
+practice you often get the journal for free. If your harness logs a message
+list with `role` fields, `openai-messages` probably already works.
+
+**If you skip this seam entirely**, everything still works — you just get no
+progress journal. The ledger, the audit, and the blocking behaviour do not
+depend on it. `onTurnEnd` degrades to using the response text alone.
+
 ### Frameworks this should map onto
 
-| Framework | Turn-end blocking | Notes |
-|---|---|---|
-| VS Code Copilot | yes | reference implementation |
-| Claude Code | yes | `Stop` hook with a block decision |
-| Cursor | partial | check whether hooks can force a turn |
-| Any OpenAI-compatible agent loop | yes | you own the loop, so you own the hook |
+| Framework | Turn-end blocking | Transcript parser | Notes |
+|---|---|---|---|
+| VS Code Copilot | yes | `vscode` | reference implementation |
+| Claude Code | yes | write one | `Stop` hook with a block decision |
+| Cursor | partial | write one | check whether hooks can force a turn |
+| LangChain / LlamaIndex | yes | `openai-messages` | you own the loop, so you own the hook |
+| Any OpenAI-compatible loop | yes | `openai-messages` | likely works unchanged |
 
 If your framework cannot block at turn end, the adapter still works as a
 reminder system — say so in your README rather than implying enforcement.
@@ -338,6 +405,9 @@ All optional, all in `~/.copilot/hooks/ledger/.env`:
 | `LEDGER_MAX_RESPONSE_CHARS` | `12000` | Audit input cap |
 | `LEDGER_MAX_OUTPUT_TOKENS` | `2048` | Output cap per call |
 | `LEDGER_REASONING` | `0` | Set `1` to let the model think (see above) |
+| `LEDGER_JOURNAL` | `1` | Set `0` to skip the progress summary call |
+| `LEDGER_MAX_JOURNAL_RECORDS` | `2000` | Max journal records a read returns |
+| `LEDGER_TRANSCRIPT_PARSER` | auto | Force a parser: `vscode`, `openai-messages` |
 | `LEDGER_PRICE_IN` | from table | USD per 1M input tokens |
 | `LEDGER_PRICE_OUT` | from table | USD per 1M output tokens |
 | `LEDGER_TRACE` | `1` | Set `0` to disable the trace log |
@@ -383,6 +453,92 @@ The audit call is the one to be aware of. It sends the agent's response prose so
 Nothing else leaves the machine. The other three hooks are local file reads. Ledgers are stored locally with mode `600`, and the trace log records counts and IDs only — never prompt or response text.
 
 If that is not acceptable, point `LEDGER_PROVIDER` at `ollama` and nothing leaves the machine at all.
+
+## Security and data exposure
+
+**Read this before you install.** `taskguard` writes your prompts and the
+agent's responses to disk in plaintext. That is by design — the ledger and the
+journal are the whole point — but it is a real exposure surface and you should
+know exactly what it is.
+
+### What is written, and where
+
+| File | Contains | Mode |
+|---|---|---|
+| `~/.copilot/hooks/ledger/.env` | Your API key | `0600` |
+| `.ledger/<session>.json` | Extracted questions and tasks, **verbatim from your prompts** | `0600` |
+| `.ledger/<session>.progress.jsonl` | Per-turn summaries, including **quoted file paths and error text** | `0600` |
+| `.ledger/<session>.telemetry.jsonl` | Tool names and derived intents, including **command lines and file paths** | `0600` |
+| `hook-trace.log.jsonl` | Counts and IDs only — **no prompt or response text** | `0600` |
+
+All of these are `0600` (owner read/write only), under
+`~/.copilot/hooks/ledger/`. On a shared machine, check the parent directory
+permissions too.
+
+### The honest caveats
+
+**1. These files contain your prompts.** The ledger stores extracted items
+verbatim. If you paste a secret into a prompt — an API key, a password, a
+customer's personal data — it can end up in `.ledger/<session>.json`. The
+extractor is told to pull out questions and tasks, not secrets, but it is a
+model and it will happily extract "rotate the AWS key AKIA..." as a task.
+
+**2. The journal quotes what the agent saw.** Turn summaries are written by a
+model reading the agent's response, so they can contain file paths, error
+messages, and fragments of code the agent was discussing. They are not a
+transcript of your files, but they are not guaranteed to be free of them.
+
+**3. Nothing is encrypted.** These are plain JSON and JSONL files. Anyone with
+read access to your user account can read them. Disk encryption (FileVault,
+LUKS) is your protection at rest; file permissions are your protection from
+other users on the same machine.
+
+**4. Nothing is deleted automatically except resolved ledgers.** A ledger is
+pruned only when every item in it is closed *and* there are more than 20
+ledgers. Journals are never pruned. To clear them:
+
+```bash
+~/.copilot/hooks/ledger/inspect.sh clear     # current session
+rm ~/.copilot/hooks/ledger/.ledger/*.jsonl   # all journals
+```
+
+**5. If you enable VS Code's OTel content capture, that is a second copy.**
+`github.copilot.chat.otel.captureContent: true` writes full prompts, responses,
+and tool arguments to the OTel destination — by default a file or a collector.
+That is VS Code's own feature, not `taskguard`'s, and it is a *separate* copy of
+the same sensitive data. See [OpenTelemetry](#opentelemetry).
+
+### What is NOT written
+
+- **Tool output.** The transcript records `{toolCallId, success}` and nothing
+  else, so command output, file contents, and HTTP responses are never stored
+  by `taskguard`.
+- **Your API key in any log.** The 401 hint names the provider, never the key.
+- **Anything outside `~/.copilot/hooks/ledger/`.** No telemetry is sent
+  anywhere except the model provider calls listed above.
+
+### Reducing the exposure
+
+| If you want to… | Do this |
+|---|---|
+| Keep the audit but drop the journal | `LEDGER_JOURNAL=0` — no summaries, no prompt text in the journal |
+| Keep nothing on disk | Don't install. The enforcement model requires local state. |
+| Keep data off the network entirely | `LEDGER_PROVIDER=ollama` — nothing leaves the machine |
+| Limit what the model sees | Lower `LEDGER_MAX_PROMPT_CHARS` / `LEDGER_MAX_RESPONSE_CHARS` |
+| Wipe everything | `./install.sh --uninstall` removes the hooks dir and config |
+
+### Threat model, stated plainly
+
+`taskguard` protects against **an agent that drops your requests**. It does not
+protect against:
+
+- A compromised machine or user account
+- Malicious code in your repo (the hooks run `node` on files in your home dir)
+- A malicious model provider
+- Secrets you paste into prompts
+
+Treat the ledger directory as you would a shell history file: useful, local,
+and not somewhere secrets belong.
 
 ### What that means in dollars
 
@@ -474,9 +630,22 @@ harness knowledge so an adapter is a translation layer, not a fork.
 
 ## How state is stored
 
-One JSON file per session in `~/.copilot/hooks/ledger/.ledger/`, named by the session UUID. Sessions are independent — two windows never share a ledger.
+Everything lives in `~/.copilot/hooks/ledger/.ledger/`, one set of files per
+session, named by the session UUID. Sessions are independent — two windows
+never share a ledger.
 
-Ledgers are pruned when **every** item in them is resolved (done or dropped). Age is not used, because sessions can legitimately run for days. An unresolved item is never deleted by pruning.
+| File | Written by | Purpose |
+|---|---|---|
+| `<session>.json` | every hook | The ledger: open questions and tasks |
+| `<session>.progress.jsonl` | Stop hook | One record per turn: headline, summary, blockers |
+| `<session>.telemetry.jsonl` | Stop hook | One record per tool call: name, intent, timestamp |
+
+All are `0600`. See [Security and data exposure](#security-and-data-exposure)
+for what they contain and how to clear them.
+
+Ledgers are pruned when **every** item in them is resolved (done or dropped).
+Age is not used, because sessions can legitimately run for days. An unresolved
+item is never deleted by pruning. Journals are never pruned automatically.
 
 ## Troubleshooting
 

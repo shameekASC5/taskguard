@@ -165,3 +165,89 @@ Worth knowing because they are the kind of thing you will hit too.
 | Nested decision | `Stop` requires `decision` inside `hookSpecificOutput`. |
 | Config is read once | Hook config is loaded at session start; edits need a new chat session. |
 | ASCII only | Emoji in `systemMessage` has been observed to break parsing. |
+
+---
+
+## Optional: the transcript parser
+
+The adapter is enough to get enforcement. If you also want the **progress
+journal** — per-turn headlines and a replayable tool timeline — your harness
+needs a transcript parser.
+
+This is a separate seam because it is a separate concern: the adapter translates
+events, the parser reads history. A harness can have one without the other.
+
+### When you need one
+
+You need a parser if you want `tools/replay.cjs` to show what happened. Without
+one, everything still works — `onTurnEnd` falls back to using the response text
+alone, and the journal records turns with no tool timeline.
+
+### Check whether you already have one
+
+Two parsers ship:
+
+| Parser | Format |
+|---|---|
+| `vscode` | JSONL with `type: "user.message"` / `"tool.execution_start"` |
+| `openai-messages` | JSON array or JSONL of `{role, content, tool_calls}` |
+
+Auto-detection sniffs the first 4 KB. If your harness logs a message list with
+`role` fields, `openai-messages` probably already works — try it before writing
+anything:
+
+```bash
+LEDGER_TRANSCRIPT_PARSER=openai-messages node tools/replay.cjs --latest
+```
+
+### Writing one
+
+Add an object to `PARSERS` in `core/parsers.cjs`:
+
+```js
+const mine = {
+  name: 'my-agent',
+  description: 'My agent\'s JSONL log',
+
+  parse(file) {
+    // Return [] rather than throwing. A parser failure must not break a hook.
+    return [{
+      index: 1,                          // 1-based, in order
+      startedAt: '2026-10-27T10:00:00Z', // ISO 8601
+      endedAt:   '2026-10-27T10:01:00Z',
+      userText: 'what the human asked',
+      assistantText: 'what the agent said',
+      tools: [{
+        tool: 'run_in_terminal',
+        intent: 'npm test',              // short, human-readable
+        at: '2026-10-27T10:00:30Z',
+        ok: true,
+      }],
+    }];
+  },
+};
+```
+
+Then register it:
+
+```js
+const PARSERS = {
+  [vscode.name]: vscode,
+  [openaiMessages.name]: openaiMessages,
+  [mine.name]: mine,
+};
+```
+
+### The one rule that matters
+
+**A user turn is one human prompt through to the next.** Not one assistant
+message. An agent turn can contain dozens of tool calls; a user turn is the unit
+a human thinks in ("I asked X, it did Y") and the unit the Stop hook fires on.
+
+If you split on assistant messages instead, the replay will show 80 turns where
+the human experienced 3, and the summaries will be fragments.
+
+### Testing it
+
+Copy `test/parsers.test.js` and add a case for your format. The existing tests
+assert the normalised shape, so a passing test means the journal will work.

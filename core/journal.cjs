@@ -56,6 +56,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
+const parsers = require('./parsers.cjs');
 
 const LEDGER_DIR = process.env.LEDGER_DIR
   || path.join(os.homedir(), '.copilot', 'hooks', 'ledger', '.ledger');
@@ -103,158 +104,37 @@ function readLines(file, limit = MAX_RECORDS) {
 // ---------------------------------------------------------------------------
 
 /**
- * Read a VS Code transcript into entries, tolerating malformed lines.
- * @returns {Array<object>}
+ * Read a transcript into normalised turns.
+ *
+ * The actual parsing lives in core/parsers.cjs, one parser per harness. This
+ * function is the seam: it resolves the right parser (explicitly, or by
+ * sniffing the file) and returns the normalised shape. Nothing here knows what
+ * VS Code is.
+ *
+ * @param {string} transcriptPath
+ * @param {string} [parserName]  Force a parser; omit to auto-detect.
+ * @returns {Array<object>} normalised turns
  */
-function readTranscript(transcriptPath) {
-  let raw;
+function parseTurns(transcriptPath, parserName) {
+  if (!transcriptPath) return [];
+  // Explicit argument wins, then the env override, then auto-detection.
+  const name = parserName || process.env.LEDGER_TRANSCRIPT_PARSER || undefined;
+  const parser = parsers.resolve(name, transcriptPath);
   try {
-    raw = fs.readFileSync(transcriptPath, 'utf8');
+    return parser.parse(transcriptPath) || [];
   } catch {
+    // A parser failure must not break the hook.
     return [];
   }
-  const entries = [];
-  for (const line of raw.split('\n')) {
-    if (!line.trim()) continue;
-    try {
-      entries.push(JSON.parse(line));
-    } catch {
-      // Skip.
-    }
-  }
-  return entries;
 }
 
-/**
- * Derive a short, human-readable intent from a tool call's arguments.
- *
- * This is what makes the replay readable. "run_in_terminal" alone says
- * nothing; "run_in_terminal: npm test" says everything. We take the most
- * informative field per tool rather than dumping the whole argument object,
- * which would be unreadable and could be very large.
- */
-function intentFrom(toolName, args) {
-  if (!args || typeof args !== 'object') return '';
-
-  const pick = (v, n = 90) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, n) : '');
-
-  switch (toolName) {
-    case 'run_in_terminal':
-      return pick(args.command);
-    case 'read_file':
-    case 'create_file':
-    case 'replace_string_in_file':
-    case 'multi_replace_string_in_file':
-      return pick(args.filePath || args.filePaths);
-    case 'grep_search':
-    case 'file_search':
-    case 'get_vscode_api':
-      return pick(args.query);
-    case 'list_dir':
-    case 'create_directory':
-      return pick(args.path || args.dirPath);
-    case 'fetch_webpage':
-      return pick(Array.isArray(args.urls) ? args.urls[0] : args.urls);
-    case 'view_image':
-      return pick(args.filePath);
-    case 'manage_todo_list':
-      return Array.isArray(args.todoList) ? `${args.todoList.length} item(s)` : '';
-    case 'memory':
-      return [pick(args.command, 20), pick(args.path, 60)].filter(Boolean).join(' ');
-    default: {
-      // Unknown tool: take the first string-valued field, which is usually
-      // the most descriptive one.
-      for (const value of Object.values(args)) {
-        const s = pick(value);
-        if (s) return s;
-      }
-      return '';
-    }
-  }
+/** Back-compat alias: older callers used readTranscript + parseTurns. */
+function readTranscript(transcriptPath) {
+  return parsers.readJsonl(transcriptPath);
 }
 
-/**
- * Split a transcript into user turns.
- *
- * A USER TURN is one user.message followed by everything until the next
- * user.message. That is the unit the Stop hook fires on, and the unit a human
- * thinks in ("I asked X, it did Y").
- *
- * An AGENT TURN is one assistant.turn_start..turn_end pair; there are many per
- * user turn (one per tool call). We keep both: the user turn is the report
- * boundary, the agent turns give us the tool timeline.
- *
- * @returns {Array<{index:number, startedAt:string, endedAt:string,
- *                  userText:string, assistantText:string,
- *                  tools:Array<{tool:string,intent:string,at:string,ok:boolean}>}>}
- */
-function parseTurns(entries) {
-  const turns = [];
-  let current = null;
-
-  const flush = () => {
-    if (current) turns.push(current);
-    current = null;
-  };
-
-  for (const entry of entries) {
-    const type = entry?.type;
-    const at = entry?.timestamp || '';
-
-    if (type === 'user.message') {
-      flush();
-      current = {
-        index: turns.length + 1,
-        startedAt: at,
-        endedAt: at,
-        userText: String(entry?.data?.content || ''),
-        assistantText: '',
-        tools: [],
-      };
-      continue;
-    }
-
-    if (!current) continue;
-
-    if (type === 'assistant.message') {
-      const content = entry?.data?.content;
-      if (typeof content === 'string' && content.trim()) {
-        current.assistantText += (current.assistantText ? '\n\n' : '') + content;
-      }
-      current.endedAt = at || current.endedAt;
-      continue;
-    }
-
-    if (type === 'tool.execution_start') {
-      const tool = String(entry?.data?.toolName || 'unknown');
-      current.tools.push({
-        tool,
-        intent: intentFrom(tool, entry?.data?.arguments),
-        at,
-        ok: true, // corrected below if a matching complete says otherwise
-        callId: entry?.data?.toolCallId || '',
-      });
-      current.endedAt = at || current.endedAt;
-      continue;
-    }
-
-    if (type === 'tool.execution_complete') {
-      const id = entry?.data?.toolCallId;
-      const ok = entry?.data?.success !== false;
-      // Match by call id; fall back to the most recent unmatched call.
-      const match = current.tools.find((t) => t.callId === id)
-        || [...current.tools].reverse().find((t) => t.ok && !t.resolved);
-      if (match) {
-        match.ok = ok;
-        match.resolved = true;
-      }
-      current.endedAt = at || current.endedAt;
-    }
-  }
-
-  flush();
-  return turns;
-}
+/** Derive a short intent string from a tool call's arguments. */
+const intentFrom = parsers.intentFrom;
 
 // ---------------------------------------------------------------------------
 // Writing

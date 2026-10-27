@@ -268,9 +268,8 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
  * what makes the summary turn-scoped: we hand the summariser one turn, never
  * the accumulated session.
  */
-function lastTurnEvidence(transcriptPath) {
-  const entries = journal.readTranscript(transcriptPath);
-  const turns = journal.parseTurns(entries);
+function lastTurnEvidence(transcriptPath, parserName) {
+  const turns = journal.parseTurns(transcriptPath, parserName);
   const last = turns[turns.length - 1];
   if (!last) return { tools: [], assistantText: '' };
   return { tools: last.tools, assistantText: last.assistantText };

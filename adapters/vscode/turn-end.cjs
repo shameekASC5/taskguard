@@ -181,14 +181,22 @@ async function main() {
   });
 
   if (!result.block) {
-    // The turn was allowed. Still surface where to look, because the journal
-    // and changelog are only useful if you actually open them, and remembering
-    // three commands per session is friction that guarantees you will not.
+    // The turn was allowed. Still surface two things:
+    //
+    //   1. The review summary, when a review ran this turn. This is the
+    //      evidence that the supervision actually happened — without it a
+    //      clean review is invisible and you cannot tell it ran at all.
+    //   2. Where to look, because the journal and changelog are only useful
+    //      if you open them, and remembering three commands is friction.
     //
     // systemMessage is top-level and renders to the user, so this is the one
     // channel available on a non-blocking turn.
-    if (result.hint && process.env.LEDGER_HINT !== '0') {
-      emit({ systemMessage: result.hint });
+    const parts = [];
+    if (result.systemMessage) parts.push(result.systemMessage);
+    if (result.hint && process.env.LEDGER_HINT !== '0') parts.push(result.hint);
+
+    if (parts.length) {
+      emit({ systemMessage: parts.join('\n\n') });
       return;
     }
     emit({});

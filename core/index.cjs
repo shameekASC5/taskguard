@@ -318,27 +318,29 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
       });
       trace('core', 'turn-end-allow', { sessionId, reason: 'all-resolved' });
 
-      // Final turn: the agent has nothing left open, so this is where it
-      // claims completion. That is the highest-value review point, because
-      // overclaiming happens exactly here.
+      // Scheduled review. Note this is NOT gated on "nothing is open" — that
+      // condition is true on most turns and would fire a review almost every
+      // time. The schedule is the only trigger.
       const turnNumber = journal.turnCount(sessionId);
-      if (shouldReview(turnNumber, true)) {
-        const nudge = await runReview(sessionId, turnEvidence, {
+      let reviewReport = null;
+      if (shouldReview(turnNumber)) {
+        reviewReport = await runReview(sessionId, turnEvidence, {
           workspace: opts.workspace,
           turnNumber,
         });
-        if (nudge) {
-          trace('core', 'turn-end-review-block', { sessionId, turnNumber });
-          return {
-            block: true,
-            reason: nudge,
-            systemMessage: `TASKGUARD REVIEW: independent reviewer found gaps`,
-            hint: renderLookHint(sessionId, stats),
-            stillOpen: [],
-            resolved: open.length,
-            blocks,
-          };
-        }
+      }
+
+      if (reviewReport && reviewReport.nudge) {
+        trace('core', 'turn-end-review-block', { sessionId, turnNumber });
+        return {
+          block: true,
+          reason: reviewReport.nudge,
+          systemMessage: reviewReport.summary,
+          hint: renderLookHint(sessionId, stats),
+          stillOpen: [],
+          resolved: open.length,
+          blocks,
+        };
       }
 
       return {
@@ -346,6 +348,9 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
         stillOpen: [],
         resolved: open.length,
         blocks,
+        // A clean review is still worth showing — it is the evidence that the
+        // supervision actually ran.
+        systemMessage: reviewReport ? reviewReport.summary : undefined,
         hint: renderLookHint(sessionId, stats),
       };
     }
@@ -357,13 +362,13 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
   });
   trace('core', 'turn-end-block', { sessionId, blocks, stillOpen: stillOpen.length, resolved });
 
-  // Periodic review on a turn that still has open items. The nudge is
+  // Scheduled review on a turn that still has open items. The nudge is
   // appended to the existing block reason rather than replacing it, so the
   // agent sees both the unresolved items and the reviewer's findings.
   const turnNumber = journal.turnCount(sessionId);
-  let reviewNudge = '';
-  if (shouldReview(turnNumber, false)) {
-    reviewNudge = await runReview(sessionId, turnEvidence, {
+  let reviewReport = null;
+  if (shouldReview(turnNumber)) {
+    reviewReport = await runReview(sessionId, turnEvidence, {
       workspace: opts.workspace,
       turnNumber,
     });
@@ -375,7 +380,7 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
       'You ended your turn, but these requested items are still unresolved:',
       ...stillOpen.map((i) => `- [${i.id}] (${i.kind}) ${i.text}`),
       'Address each one now, or explicitly state why it is no longer needed.',
-      reviewNudge ? `\n${reviewNudge}` : '',
+      reviewReport?.nudge ? `\n${reviewReport.nudge}` : '',
     ].join('\n'),
     systemMessage: [
       `TASKGUARD NUDGE #${blocks}: turn blocked - ${stillOpen.length} item(s) still open`,
@@ -458,18 +463,23 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
 /**
  * Whether this turn should get an adversarial review.
  *
- * Two triggers:
- *   1. Every Nth turn (LEDGER_REVIEW_EVERY, default 5).
- *   2. The final turn — when the agent stops with nothing left open. This is
- *      the most valuable review point, because the last turn is where the
- *      agent summarises and claims completion, which is exactly where
- *      overclaiming happens.
+ * ONE trigger: every Nth turn. That is it.
+ *
+ * There is deliberately no "final turn" trigger, because there is no reliable
+ * way to know a turn is final. The obvious candidate — "no items remain open"
+ * — is not it: measured against real sessions, 85% of turns in a long session
+ * end with zero open items, because the agent resolves what it was asked and
+ * stops. Treating that as "final" would run a review on almost every turn,
+ * which is the opposite of the cost control this is supposed to provide.
+ *
+ * A genuine "session ended" signal would need a quiet period (no new turn for
+ * N minutes), which a Stop hook cannot observe — it only runs at the moment a
+ * turn ends. So the schedule is the only honest trigger.
  *
  * @param {number} turnNumber  1-based turn index.
- * @param {boolean} isFinal    True when no items remain open.
  * @returns {boolean}
  */
-function shouldReview(turnNumber, isFinal) {
+function shouldReview(turnNumber) {
   if (process.env.LEDGER_REVIEW === '0') return false;
 
   const every = process.env.LEDGER_REVIEW_EVERY === undefined
@@ -478,8 +488,6 @@ function shouldReview(turnNumber, isFinal) {
 
   // 0 disables scheduled reviews; manual only.
   if (every === 0) return false;
-
-  if (isFinal) return true;
   if (!Number.isFinite(every) || every < 1) return false;
   return turnNumber > 0 && turnNumber % every === 0;
 }
@@ -488,22 +496,30 @@ function shouldReview(turnNumber, isFinal) {
  * Run an adversarial review and record it.
  *
  * Never throws and never blocks the turn on its own failure: a reviewer that
- * cannot run must not break enforcement. Returns the nudge text when the
- * reviewer found high-severity gaps, else ''.
+ * cannot run must not break enforcement.
  *
  * @param {string} sessionId
  * @param {object} evidence  { tools, assistantText }
  * @param {object} opts      { workspace, turnNumber }
- * @returns {Promise<string>} nudge text, or '' if nothing to report
+ * @returns {Promise<{nudge:string, summary:string, findings:Array}|null>}
+ *          null when the review could not run at all.
  */
 async function runReview(sessionId, evidence, opts = {}) {
   const status = llm.reviewerStatus();
   if (!status.ok) {
-    // Say so once per session rather than silently doing nothing — a review
-    // that never runs is worse than one that is not configured, because you
-    // would believe you were covered.
+    // Say so rather than silently doing nothing — a review that never runs is
+    // worse than one that is not configured, because you would believe you
+    // were covered.
     trace('core', 'review-skipped', { sessionId, reason: status.reason });
-    return '';
+    return {
+      nudge: '',
+      summary: [
+        `TASKGUARD REVIEW — skipped`,
+        `  ${status.reason}`,
+        `  Configure LEDGER_REVIEW_MODEL in ~/.copilot/hooks/ledger/.env`,
+      ].join('\n'),
+      findings: [],
+    };
   }
 
   let result;
@@ -515,15 +531,24 @@ async function runReview(sessionId, evidence, opts = {}) {
     });
   } catch (err) {
     trace('core', 'review-failed', { sessionId, error: err.message });
-    return '';
+    return null;
   }
 
   if (!result.ok) {
     trace('core', 'review-failed', { sessionId, reason: result.reason });
-    return '';
+    return {
+      nudge: '',
+      summary: `TASKGUARD REVIEW — could not complete\n  ${result.reason}`,
+      findings: [],
+    };
   }
 
   const blocking = review.blockingFindings(result.findings);
+  const confirmed = result.findings.filter((f) => f.verdict === 'confirmed').length;
+  const partial = result.findings.filter((f) => f.verdict === 'partial').length;
+  const unverified = result.findings.filter((f) => f.verdict === 'unverified').length;
+  const falseCount = result.findings.filter((f) => f.verdict === 'false').length;
+
   trace('core', 'review-complete', {
     sessionId,
     turn: opts.turnNumber,
@@ -538,7 +563,7 @@ async function runReview(sessionId, evidence, opts = {}) {
     kind: 'review',
     headline: blocking.length
       ? `Reviewer found ${blocking.length} high-severity gap(s)`
-      : `Reviewer confirmed ${result.findings.length} claim(s)`,
+      : `Reviewer confirmed ${confirmed}/${result.findings.length} claim(s)`,
     summary: result.findings
       .map((f) => `[${f.claim}] ${f.verdict}: ${f.evidence}`)
       .join('\n')
@@ -549,7 +574,30 @@ async function runReview(sessionId, evidence, opts = {}) {
     blocked: false,
   });
 
-  return review.renderNudge(result.findings);
+  // The in-chat summary. Names the model so you can see WHICH reviewer ran,
+  // and gives the verdict breakdown so a clean review is still visible
+  // evidence that the supervision happened.
+  const lines = [
+    `TASKGUARD REVIEW — ${status.model} (${llm.familyOf(status.model)})`,
+    `  ${result.claims.length} claim(s) checked · `
+    + `${confirmed} confirmed · ${partial} partial · ${falseCount} false · ${unverified} unverified`,
+  ];
+
+  if (blocking.length) {
+    lines.push('');
+    for (const f of blocking) {
+      lines.push(`  ✖ [${f.claim}] ${f.verdict.toUpperCase()}: ${f.evidence}`);
+      if (f.fix) lines.push(`    fix: ${f.fix}`);
+    }
+  } else {
+    lines.push('  ✔ no high-severity gaps');
+  }
+
+  return {
+    nudge: review.renderNudge(result.findings),
+    summary: lines.join('\n'),
+    findings: result.findings,
+  };
 }
 
 /**

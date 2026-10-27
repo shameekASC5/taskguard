@@ -25,6 +25,7 @@ const { trace } = require('./trace.cjs');
 const llm = require('./llm.cjs');
 const journal = require('./journal.cjs');
 const changelog = require('./changelog.cjs');
+const review = require('./review.cjs');
 
 /**
  * Collapse semantic duplicates once the ledger has this many open items.
@@ -35,6 +36,34 @@ const changelog = require('./changelog.cjs');
  * one extra small model call.
  */
 const COLLAPSE_MIN_OPEN = 12;
+
+/**
+ * How often to run an adversarial review, in turns.
+ *
+ * A review is an INVESTIGATOR, not a classifier: it extracts claims, plans
+ * checks, then runs 5-15 tool calls with 20k-60k input tokens accumulating.
+ * Measured at ~$0.02 per review, versus ~$0.0005 for a normal turn — 40x.
+ *
+ * Measured against real history (32-turn average session):
+ *
+ *   every 1   -> 33 reviews, $0.68/session   (review is 98% of cost)
+ *   every 5   ->  7 reviews, $0.14/session   (review is 90% of cost)
+ *   every 10  ->  4 reviews, $0.08/session   (review is 84% of cost)
+ *   every 20  ->  2 reviews, $0.04/session   (review is 72% of cost)
+ *   off       ->  1 review,  $0.02/session   (final turn only)
+ *
+ * 10 is the default: four reviews across a long session, and the review cost
+ * stays under 85% of a total that is still cents. At 5 the review dominates
+ * everything else the system does, which is hard to justify for a supervision
+ * layer.
+ *
+ * The FINAL turn is always reviewed regardless of this setting, because that
+ * is where the agent summarises and claims completion — the highest-value
+ * review point.
+ *
+ * Set LEDGER_REVIEW_EVERY=0 for final-turn-only, or 1 for every turn.
+ */
+const REVIEW_EVERY_DEFAULT = 10;
 
 /**
  * The five lifecycle moments an adapter must map onto its harness.
@@ -288,6 +317,30 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
         openCount: 0, resolved: open.length, blocked: false, workspace: opts.workspace,
       });
       trace('core', 'turn-end-allow', { sessionId, reason: 'all-resolved' });
+
+      // Final turn: the agent has nothing left open, so this is where it
+      // claims completion. That is the highest-value review point, because
+      // overclaiming happens exactly here.
+      const turnNumber = journal.turnCount(sessionId);
+      if (shouldReview(turnNumber, true)) {
+        const nudge = await runReview(sessionId, turnEvidence, {
+          workspace: opts.workspace,
+          turnNumber,
+        });
+        if (nudge) {
+          trace('core', 'turn-end-review-block', { sessionId, turnNumber });
+          return {
+            block: true,
+            reason: nudge,
+            systemMessage: `TASKGUARD REVIEW: independent reviewer found gaps`,
+            hint: renderLookHint(sessionId, stats),
+            stillOpen: [],
+            resolved: open.length,
+            blocks,
+          };
+        }
+      }
+
       return {
         block: false,
         stillOpen: [],
@@ -304,12 +357,25 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
   });
   trace('core', 'turn-end-block', { sessionId, blocks, stillOpen: stillOpen.length, resolved });
 
+  // Periodic review on a turn that still has open items. The nudge is
+  // appended to the existing block reason rather than replacing it, so the
+  // agent sees both the unresolved items and the reviewer's findings.
+  const turnNumber = journal.turnCount(sessionId);
+  let reviewNudge = '';
+  if (shouldReview(turnNumber, false)) {
+    reviewNudge = await runReview(sessionId, turnEvidence, {
+      workspace: opts.workspace,
+      turnNumber,
+    });
+  }
+
   return {
     block: true,
     reason: [
       'You ended your turn, but these requested items are still unresolved:',
       ...stillOpen.map((i) => `- [${i.id}] (${i.kind}) ${i.text}`),
       'Address each one now, or explicitly state why it is no longer needed.',
+      reviewNudge ? `\n${reviewNudge}` : '',
     ].join('\n'),
     systemMessage: [
       `TASKGUARD NUDGE #${blocks}: turn blocked - ${stillOpen.length} item(s) still open`,
@@ -387,6 +453,103 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
   });
 
   return writeChangelog(sessionId, outcome.workspace);
+}
+
+/**
+ * Whether this turn should get an adversarial review.
+ *
+ * Two triggers:
+ *   1. Every Nth turn (LEDGER_REVIEW_EVERY, default 5).
+ *   2. The final turn — when the agent stops with nothing left open. This is
+ *      the most valuable review point, because the last turn is where the
+ *      agent summarises and claims completion, which is exactly where
+ *      overclaiming happens.
+ *
+ * @param {number} turnNumber  1-based turn index.
+ * @param {boolean} isFinal    True when no items remain open.
+ * @returns {boolean}
+ */
+function shouldReview(turnNumber, isFinal) {
+  if (process.env.LEDGER_REVIEW === '0') return false;
+
+  const every = process.env.LEDGER_REVIEW_EVERY === undefined
+    ? REVIEW_EVERY_DEFAULT
+    : Number(process.env.LEDGER_REVIEW_EVERY);
+
+  // 0 disables scheduled reviews; manual only.
+  if (every === 0) return false;
+
+  if (isFinal) return true;
+  if (!Number.isFinite(every) || every < 1) return false;
+  return turnNumber > 0 && turnNumber % every === 0;
+}
+
+/**
+ * Run an adversarial review and record it.
+ *
+ * Never throws and never blocks the turn on its own failure: a reviewer that
+ * cannot run must not break enforcement. Returns the nudge text when the
+ * reviewer found high-severity gaps, else ''.
+ *
+ * @param {string} sessionId
+ * @param {object} evidence  { tools, assistantText }
+ * @param {object} opts      { workspace, turnNumber }
+ * @returns {Promise<string>} nudge text, or '' if nothing to report
+ */
+async function runReview(sessionId, evidence, opts = {}) {
+  const status = llm.reviewerStatus();
+  if (!status.ok) {
+    // Say so once per session rather than silently doing nothing — a review
+    // that never runs is worse than one that is not configured, because you
+    // would believe you were covered.
+    trace('core', 'review-skipped', { sessionId, reason: status.reason });
+    return '';
+  }
+
+  let result;
+  try {
+    result = await review.review({
+      assistantText: evidence.assistantText,
+      tools: evidence.tools,
+      workspace: opts.workspace || '',
+    });
+  } catch (err) {
+    trace('core', 'review-failed', { sessionId, error: err.message });
+    return '';
+  }
+
+  if (!result.ok) {
+    trace('core', 'review-failed', { sessionId, reason: result.reason });
+    return '';
+  }
+
+  const blocking = review.blockingFindings(result.findings);
+  trace('core', 'review-complete', {
+    sessionId,
+    turn: opts.turnNumber,
+    claims: result.claims.length,
+    findings: result.findings.length,
+    blocking: blocking.length,
+  });
+
+  // Record the review in the journal so it is visible in the replay.
+  journal.recordTurn(sessionId, {
+    turn: journal.turnCount(sessionId) + 1,
+    kind: 'review',
+    headline: blocking.length
+      ? `Reviewer found ${blocking.length} high-severity gap(s)`
+      : `Reviewer confirmed ${result.findings.length} claim(s)`,
+    summary: result.findings
+      .map((f) => `[${f.claim}] ${f.verdict}: ${f.evidence}`)
+      .join('\n')
+      .slice(0, 2000),
+    completed: result.findings.filter((f) => f.verdict === 'confirmed').map((f) => f.evidence),
+    blockers: blocking.map((f) => f.evidence),
+    toolCount: 0,
+    blocked: false,
+  });
+
+  return review.renderNudge(result.findings);
 }
 
 /**

@@ -239,6 +239,123 @@ function getModel() {
   return configured;
 }
 
+// ---------------------------------------------------------------------------
+// Reviewer model — a SEPARATE, deliberately different model
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the reviewer's provider.
+ *
+ * The adversarial reviewer must come from a DIFFERENT MODEL FAMILY than the
+ * agent it is reviewing. A reviewer from the same family shares the same blind
+ * spots and the same failure modes, so it will agree with itself — which
+ * defeats the entire point of an independent check.
+ *
+ * Falls back to the main provider when unset, but warns, because that silently
+ * removes the property you are paying for.
+ */
+function getReviewerProviderName() {
+  const name = (cfg('LEDGER_REVIEW_PROVIDER') || '').toLowerCase();
+  if (name && PROVIDERS[name]) return name;
+  return getProviderName();
+}
+
+function getReviewerProvider() {
+  return PROVIDERS[getReviewerProviderName()];
+}
+
+/**
+ * Resolve the reviewer's model id.
+ *
+ * No default. The cross-family choice is a deliberate decision, so we require
+ * it to be made explicitly rather than shipping a default that might happen to
+ * match the main model.
+ */
+function getReviewerModel() {
+  const configured = cfg('LEDGER_REVIEW_MODEL');
+  if (configured) return configured;
+  return '';
+}
+
+/**
+ * The model family, for the same-family check.
+ *
+ * OpenRouter ids are namespaced ("vendor/model"), so the vendor is the family.
+ * Bare ids fall back to the leading token before a dash or dot.
+ */
+function familyOf(modelId) {
+  const id = String(modelId || '').toLowerCase();
+  if (!id) return '';
+  if (id.includes('/')) return id.split('/')[0];
+  return id.split(/[-.]/)[0];
+}
+
+/**
+ * Whether the reviewer is configured and genuinely independent.
+ *
+ * @returns {{ok:boolean, reason?:string, model:string, provider:string}}
+ */
+function reviewerStatus() {
+  const model = getReviewerModel();
+  const provider = getReviewerProviderName();
+
+  if (!model) {
+    return { ok: false, reason: 'LEDGER_REVIEW_MODEL is not set', model: '', provider };
+  }
+
+  const mainFamily = familyOf(getModel());
+  const reviewFamily = familyOf(model);
+  if (mainFamily && reviewFamily && mainFamily === reviewFamily) {
+    return {
+      ok: false,
+      reason: `reviewer "${model}" is the same model family as the main model `
+        + `("${mainFamily}"). An independent reviewer must come from a different `
+        + `family, or it shares the same blind spots.`,
+      model,
+      provider,
+    };
+  }
+
+  return { ok: true, model, provider };
+}
+
+/**
+ * Reasoning effort for the reviewer.
+ *
+ * The main hooks run with reasoning OFF: they are classifiers, and thinking
+ * only burns the output budget. The reviewer is the opposite — it has to
+ * reason about whether a claim is actually true, which is exactly the kind of
+ * task reasoning helps with.
+ *
+ * Default "medium": enough to catch a fabricated test result or a claim that
+ * does not match the diff, without paying for deep deliberation on every
+ * review. Raise to "high" if you want it to work harder.
+ *
+ * NOTE: reasoning tokens count against max_tokens. A reviewer with a small
+ * max_tokens will spend the whole budget thinking and return empty content —
+ * the exact failure that broke the audit. So the reviewer gets a much larger
+ * budget than the classifiers.
+ */
+function reviewerReasoning() {
+  const effort = (cfg('LEDGER_REVIEW_EFFORT') || 'medium').toLowerCase();
+  const allowed = ['max', 'xhigh', 'high', 'medium', 'low', 'minimal', 'none'];
+  const chosen = allowed.includes(effort) ? effort : 'medium';
+
+  if (chosen === 'none') return null;
+
+  const provider = getReviewerProviderName();
+  // Providers that take the OpenRouter-style object.
+  if (['openrouter', 'deepseek', 'together', 'fireworks'].includes(provider)) {
+    return { reasoning: { effort: chosen } };
+  }
+  // Providers that take the OpenAI-style scalar.
+  if (['openai', 'groq'].includes(provider)) {
+    return { reasoning_effort: chosen };
+  }
+  // Ollama and unknown gateways: no known switch.
+  return null;
+}
+
 /**
  * Call the model and parse a JSON response.
  * Returns null on any failure — hooks must degrade gracefully, never throw.
@@ -334,11 +451,131 @@ async function callJson(system, user, timeoutMs = 30000) {
   }
 }
 
+/**
+ * Call the REVIEWER model.
+ *
+ * Deliberately separate from callJson because almost every parameter differs:
+ *
+ *   model      a different family, so the review is genuinely independent
+ *   reasoning  ON at medium effort, because judging a claim is a reasoning
+ *              task — the opposite of the classifiers, which run with it off
+ *   max_tokens much larger, because reasoning tokens count against the budget
+ *              and a small cap means the model thinks and returns nothing
+ *   key        may be a different provider's key
+ *
+ * Returns null on any failure, like callJson. A reviewer that cannot run must
+ * never break the turn.
+ *
+ * @param {string} system
+ * @param {string} user
+ * @param {number} timeoutMs
+ * @returns {Promise<any|null>}
+ */
+async function callReviewer(system, user, timeoutMs = 120000) {
+  const status = reviewerStatus();
+  if (!status.ok) {
+    process.stderr.write(`ledger: reviewer unavailable — ${status.reason}\n`);
+    return null;
+  }
+
+  const providerName = status.provider;
+  const provider = PROVIDERS[providerName];
+
+  // The reviewer may live on a different provider, so resolve its key
+  // separately. LEDGER_REVIEW_API_KEY wins; otherwise fall back to the shared
+  // key, which is correct when both models are on OpenRouter.
+  const apiKey = cfg('LEDGER_REVIEW_API_KEY') || getKey();
+  if (!apiKey && provider.keyEnv !== 'OLLAMA_API_KEY') {
+    process.stderr.write(
+      `ledger: no API key for reviewer provider "${providerName}". `
+      + `Set LEDGER_REVIEW_API_KEY (or LEDGER_API_KEY) in ~/.copilot/hooks/ledger/.env\n`,
+    );
+    return null;
+  }
+
+  const url = cfg('LEDGER_REVIEW_BASE_URL') || provider.url;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const body = {
+    model: status.model,
+    messages: [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ],
+    // Not 0. A reviewer at temperature 0 tends to produce the same verdict
+    // every time; a little variation makes it more likely to notice something
+    // the first pass missed. Still low enough to stay factual.
+    temperature: 0.2,
+    // Reasoning tokens count against this budget, so it must be generous.
+    // 8192 leaves room for medium-effort thinking plus the findings JSON.
+    max_tokens: Number(cfg('LEDGER_REVIEW_MAX_OUTPUT_TOKENS')) || 8192,
+  };
+
+  const reasoning = reviewerReasoning();
+  if (reasoning) Object.assign(body, reasoning);
+  if (provider.jsonMode) body.response_format = { type: 'json_object' };
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      signal: controller.signal,
+      headers: {
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      process.stderr.write(
+        `ledger: reviewer ${providerName} ${res.status} ${res.statusText} `
+        + `(model "${status.model}")\n`,
+      );
+      return null;
+    }
+
+    const data = await res.json();
+    const choice = data?.choices?.[0];
+    const text = choice?.message?.content;
+
+    // A reasoning model that spent its whole budget thinking returns empty
+    // content with finish_reason "length". Say so explicitly rather than
+    // returning a bare null, because the cause is not obvious.
+    if (!text) {
+      const reasoningTokens = data?.usage?.completion_tokens_details?.reasoning_tokens;
+      if (choice?.finish_reason === 'length') {
+        process.stderr.write(
+          `ledger: reviewer hit the output cap while reasoning `
+          + `(${reasoningTokens ?? '?'} reasoning tokens). `
+          + `Raise LEDGER_REVIEW_MAX_OUTPUT_TOKENS or lower LEDGER_REVIEW_EFFORT.\n`,
+        );
+      }
+      return null;
+    }
+
+    const cleaned = text.replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+    return JSON.parse(cleaned);
+  } catch (err) {
+    process.stderr.write(`ledger: reviewer call failed (${providerName}): ${err.message}\n`);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 module.exports = {
   callJson,
+  callReviewer,
   getModel,
   getProviderName,
   getProvider,
+  getReviewerModel,
+  getReviewerProviderName,
+  reviewerStatus,
+  reviewerReasoning,
+  familyOf,
   reasoningOff,
   PROVIDERS,
 };

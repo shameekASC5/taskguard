@@ -356,6 +356,86 @@ gives you automatic coverage, the agent gives you depth when you want it.
 
 Set `LEDGER_CHANGELOG=0` to disable it.
 
+### Adversarial review
+
+The audit asks *"does the response say this was handled?"* — it reads prose and
+takes the agent's word for it. The reviewer asks a harder question: **"is that
+actually true?"**
+
+It extracts the turn's falsifiable claims, plans how to check each one, then
+goes and looks — reading files, running tests, inspecting the diff. The audit
+is a classifier; this is an investigator.
+
+```bash
+node tools/review.cjs --status             # is the reviewer configured?
+node tools/review.cjs <sessionId>          # review a session now
+node tools/review.cjs <sessionId> --last 3 # just the newest 3 turns
+```
+
+**The reviewer must be a different model family.** A reviewer from the same
+family shares the same blind spots and will agree with itself, which defeats
+the entire point. `taskguard` enforces this and refuses to run otherwise:
+
+```
+✖ reviewer is NOT usable: reviewer "deepseek/deepseek-v4.1-flash" is the same
+  model family as the main model ("deepseek"). An independent reviewer must
+  come from a different family, or it shares the same blind spots.
+```
+
+Configure it in `~/.copilot/hooks/ledger/.env`:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LEDGER_REVIEW_MODEL` | — | **Required.** A different family, e.g. `qwen/qwen3.8-flash` |
+| `LEDGER_REVIEW_PROVIDER` | main provider | Provider preset for the reviewer |
+| `LEDGER_REVIEW_EFFORT` | `medium` | Reasoning effort: `low`/`medium`/`high`/`max` |
+| `LEDGER_REVIEW_API_KEY` | falls back to `LEDGER_API_KEY` | Key, if a different provider |
+| `LEDGER_REVIEW_EVERY` | `10` | Review every N turns. `0` = final turn only |
+| `LEDGER_REVIEW` | `1` | Set `0` to disable review entirely |
+
+**Reasoning is ON for the reviewer, and OFF for everything else.** That is
+deliberate and it is the opposite of the other hooks. The classifiers are
+answering "is this item done, yes or no" — thinking only burns the output
+budget. The reviewer has to reason about whether a claim is true, which is
+exactly what reasoning is for. `medium` is the default: enough to catch a
+fabricated test result, without paying for deep deliberation on every review.
+
+**Reviews run on a schedule, not every turn.** A review is an investigator —
+5–15 tool calls with 20k–60k input tokens accumulating — so it costs ~$0.02
+against ~$0.0005 for a normal turn. That is 40×. Measured against real history
+(a 32-turn average session):
+
+| Frequency | Reviews/session | Review cost | Total session |
+|---|---|---|---|
+| Every turn | 33 | $0.68 | $0.69 |
+| Every 5 | 7 | $0.14 | $0.16 |
+| **Every 10 (default)** | **4** | **$0.08** | **$0.10** |
+| Every 20 | 2 | $0.04 | $0.06 |
+| Final turn only | 1 | $0.02 | $0.04 |
+
+**The final turn is always reviewed**, regardless of the interval. That is
+where the agent summarises and claims completion — the highest-value review
+point, because that is where overclaiming happens.
+
+**Only high-severity findings block.** A reviewer that interrupts on nitpicks
+becomes noise, and noise gets ignored. Findings are graded:
+
+| Verdict | Meaning |
+|---|---|
+| `confirmed` | Checked, and the claim holds |
+| `partial` | True in part; the detail or scope is wrong |
+| `unverified` | Could not be checked read-only — **not** treated as a gap |
+| `false` | Checked, and the claim does not hold |
+
+Only `false` and `partial` at `high` severity produce a nudge. `unverified` is
+deliberately excluded: "I could not check" is a limitation of the reviewer, not
+evidence of a gap, and blocking on it would punish the agent for the reviewer's
+shortcomings.
+
+The nudge tells the agent it may push back — the reviewer can be wrong, and the
+agent should be able to say so rather than being forced to comply with a bad
+finding.
+
 ### OpenTelemetry
 
 VS Code **does** emit OTel for Copilot agent activity — traces, metrics, and

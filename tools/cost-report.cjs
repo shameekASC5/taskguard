@@ -177,6 +177,32 @@ function main() {
   const typicalPerSession = typicalPerTurn * avgTurns;
   const worstPerSession = worstPerTurn * avgTurns;
 
+  // --- adversarial review -------------------------------------------------
+  //
+  // A review is an INVESTIGATOR, not a classifier: it extracts claims, plans
+  // checks, then runs 5-15 tool calls with 20k-60k input tokens accumulating.
+  // That makes it 16-40x a normal turn, which is why it runs on a schedule
+  // rather than every turn.
+  //
+  // It also runs on a DIFFERENT model, so it has its own rate card.
+  const reviewModel = process.env.LEDGER_REVIEW_MODEL || '';
+  const reviewPrice = reviewModel ? priceFor(reviewModel) : price;
+
+  const REVIEW_IN_TOK = 35000;   // claims + plan + accumulated tool output
+  const REVIEW_OUT_TOK = 2000;   // findings JSON, plus reasoning tokens
+
+  const perReview = ((REVIEW_IN_TOK * reviewPrice.in) + (REVIEW_OUT_TOK * reviewPrice.out)) / 1e6;
+
+  // How many reviews an average session gets: one every N turns, plus the
+  // final turn. The default must match REVIEW_EVERY_DEFAULT in core/index.cjs
+  // or this report lies about what the system actually does.
+  const every = process.env.LEDGER_REVIEW_EVERY === undefined
+    ? 10
+    : Number(process.env.LEDGER_REVIEW_EVERY);
+  const scheduled = Number.isFinite(every) && every > 0 ? Math.floor(avgTurns / every) : 0;
+  const reviewsPerSession = reviewModel ? scheduled + 1 : 0;
+  const reviewPerSession = perReview * reviewsPerSession;
+
   if (process.argv.includes('--json')) {
     process.stdout.write(`${JSON.stringify({
       model,
@@ -190,6 +216,18 @@ function main() {
       },
       perTurn: { typical: typicalPerTurn, worst: worstPerTurn },
       perSession: { typical: typicalPerSession, worst: worstPerSession },
+      review: {
+        configured: Boolean(reviewModel),
+        model: reviewModel,
+        price: reviewPrice,
+        everyTurns: every,
+        perReview,
+        reviewsPerSession,
+        perSession: reviewPerSession,
+      },
+      total: {
+        perSession: typicalPerSession + reviewPerSession,
+      },
     }, null, 2)}\n`);
     return;
   }
@@ -227,6 +265,21 @@ function main() {
   console.log(`Across an average session of ${avgTurns.toFixed(1)} turns:`);
   console.log(`  typical:       ${usd(typicalPerSession)}`);
   console.log(`  worst case:    ${usd(worstPerSession)}`);
+  console.log('');
+
+  if (reviewModel) {
+    console.log(`Adversarial review (${reviewModel}, every ${every} turns + final):`);
+    console.log(`  per review:    ${usd(perReview)}`);
+    console.log(`  per session:   ${usd(reviewPerSession)}  (${reviewsPerSession} review(s))`);
+    console.log('');
+    console.log(`Total per session: ${usd(typicalPerSession + reviewPerSession)}`);
+    console.log(`  (${Math.round((reviewPerSession / (typicalPerSession + reviewPerSession)) * 100)}% of it is review)`);
+  } else {
+    console.log('Adversarial review: not configured.');
+    console.log('  Set LEDGER_REVIEW_MODEL to a DIFFERENT model family to enable it.');
+    console.log('  A review is 16-40x a normal turn, so it runs on a schedule,');
+    console.log('  not every turn.');
+  }
   console.log('');
   console.log('For scale, a single Copilot turn on a frontier model typically');
   console.log('costs more than an entire session of ledger overhead.');

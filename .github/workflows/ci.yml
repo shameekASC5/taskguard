@@ -93,6 +93,49 @@ jobs:
             exit 1
           fi
 
+      # A broken Mermaid block renders as a red error box in the README, which
+      # is worse than no diagram. This parses every block with the real
+      # Mermaid parser so a syntax error fails CI instead of shipping.
+      - name: Mermaid diagrams parse
+        run: |
+          npm install --no-save mermaid@11 jsdom >/dev/null 2>&1
+          node - <<'JS'
+          const fs = require('node:fs');
+          const { JSDOM } = require('jsdom');
+
+          const dom = new JSDOM('<!DOCTYPE html><body></body>', { pretendToBeVisual: true });
+          global.window = dom.window;
+          global.document = dom.window.document;
+          Object.defineProperty(global, 'navigator', { value: dom.window.navigator, configurable: true });
+
+          (async () => {
+            const mermaid = (await import('mermaid')).default;
+            mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
+
+            const files = ['README.md', 'docs/ADAPTERS.md'];
+            let total = 0;
+            let failed = 0;
+
+            for (const file of files) {
+              if (!fs.existsSync(file)) continue;
+              const src = fs.readFileSync(file, 'utf8');
+              const blocks = [...src.matchAll(/```mermaid\n([\s\S]*?)```/g)].map((m) => m[1]);
+              for (let i = 0; i < blocks.length; i += 1) {
+                total += 1;
+                try {
+                  await mermaid.parse(blocks[i]);
+                } catch (err) {
+                  failed += 1;
+                  console.log(`::error file=${file}::Mermaid block ${i + 1} does not parse: ${String(err.message || err).split('\n')[0]}`);
+                }
+              }
+            }
+
+            console.log(`${total - failed}/${total} Mermaid diagrams parse`);
+            if (failed > 0) process.exit(1);
+          })();
+          JS
+
   install-smoke:
     name: fresh install actually runs
     runs-on: ubuntu-latest

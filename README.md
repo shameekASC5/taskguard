@@ -24,6 +24,61 @@ no longer needed.
 
 ![Turn blocked](docs/images/blocked.png)
 
+## Who controls what
+
+The single most important thing to understand: **the agent never touches the
+ledger.** It has no write path. It cannot mark its own items done, cannot edit
+the journal, and cannot see the audit prompt.
+
+That separation is the whole design. An agent that could update its own
+scorecard would be grading its own homework.
+
+```mermaid
+flowchart TB
+    subgraph agent["🤖 THE AGENT — has no write path to state"]
+        direction LR
+        A1["Reads your prompt"]
+        A2["Calls tools"]
+        A3["Writes a reply"]
+    end
+
+    subgraph hooks["🔒 TASKGUARD HOOKS — separate processes"]
+        direction LR
+        H1["Extract asks<br/>from the prompt"]
+        H2["Audit the reply"]
+        H3["Write ledger<br/>+ journal"]
+    end
+
+    subgraph state["💾 LOCAL STATE — mode 0600"]
+        direction LR
+        S1[("ledger.json<br/>what is open")]
+        S2[("progress.jsonl<br/>what happened")]
+    end
+
+    A1 ==>|"1. prompt"| H1
+    H1 ==>|"2. writes"| S1
+    S1 ==>|"3. nudge injected<br/>into context"| A2
+    A3 ==>|"4. reply"| H2
+    H2 ==>|"5. reads"| S1
+    H2 ==>|"6. writes"| S1
+    H2 ==>|"7. writes"| S2
+    H3 -.-> S1
+
+    A2 -. "❌ cannot read or write" .-x S1
+
+    style agent fill:#1e3a5f,stroke:#4a90d9,color:#fff
+    style hooks fill:#3d2f1f,stroke:#d9a441,color:#fff
+    style state fill:#1f3d2f,stroke:#41d98a,color:#fff
+```
+
+Three properties fall out of this:
+
+| Property | Why it matters |
+|---|---|
+| **The agent cannot lie to the ledger** | No write path. Only hooks write state. |
+| **The audit is independent** | A separate model call with a fresh context reads the evidence. |
+| **The agent cannot see the audit** | The audit prompt is never in the agent's context. |
+
 ## How it works
 
 Five hooks, three of which never touch the network:
@@ -37,6 +92,114 @@ Five hooks, three of which never touch the network:
 | `agentStop` | `turn-end.cjs` | Audits the turn; blocks if items are unresolved; writes the progress journal | 2 small calls |
 
 Three model calls per turn, all small and bounded. See [Cost](#cost).
+
+### One turn, end to end
+
+This is the full lifecycle. Note where the agent is *not* involved — every
+decision about what counts as done happens outside it.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor You
+    participant Agent as 🤖 Agent
+    participant Hook as 🔒 Hooks
+    participant LLM as 🧠 Audit model<br/>(fresh context)
+    participant State as 💾 Ledger + journal
+
+    You->>Agent: "Deploy command? Also fix the login bug."
+    Agent->>Hook: userPromptSubmitted
+    Hook->>LLM: extract asks from prompt
+    LLM-->>Hook: [q1 deploy command, t2 fix login]
+    Hook->>State: write 2 open items
+
+    Note over Agent,Hook: Agent works. It never sees the ledger.
+
+    Agent->>Hook: preToolUse (about to run a tool)
+    Hook->>State: read open items
+    State-->>Hook: 2 open
+    Hook-->>Agent: inject "OPEN ITEMS: q1, t2"
+    Note right of Agent: First time this turn.<br/>Injected once, not per tool.
+
+    Agent->>Agent: run tools, write reply
+
+    Agent->>Hook: agentStop (turn ending)
+    Hook->>State: read open items
+    Hook->>LLM: audit: is each item done?<br/>(reply text + tool timeline)
+    LLM-->>Hook: q1 done, t2 open
+
+    alt all items resolved
+        Hook->>State: mark done, write journal
+        Hook-->>Agent: allow turn to end
+    else items still open
+        Hook->>State: write journal (blocked)
+        Hook-->>Agent: BLOCK + reason
+        Note right of Agent: Forced continuation turn.<br/>Max 3 blocks, then it gives up.
+        Agent->>Agent: address the remaining item
+    end
+```
+
+### What the agent sees vs. what it does not
+
+The boundary is worth stating explicitly, because it is what makes the
+enforcement trustworthy. Everything in the right column is invisible to the
+agent — it is not in its context, and it has no way to read it.
+
+| ✅ In the agent's context | 🔒 Never in the agent's context |
+|---|---|
+| Your prompt | The audit prompt |
+| The open-items nudge | The audit model's verdicts |
+| The block reason | The ledger file itself |
+| Its own tool results | The journal |
+| | Your API key |
+
+The flow is **one-way**: hooks can inject nudges and block turns, but the agent
+has no channel back. It cannot mark an item done, cannot edit the journal, and
+cannot see why the audit decided what it decided.
+
+```mermaid
+flowchart LR
+    S[("💾 Ledger + journal<br/>mode 0600")] -->|"read"| H["🔒 Hook process"]
+    H -->|"nudge / block reason"| A["🤖 Agent context"]
+    H -->|"write"| S
+
+    A -. "❌ no write path" .-x S
+
+    style S fill:#1f3d2f,stroke:#41d98a,color:#fff
+    style H fill:#3d2f1f,stroke:#d9a441,color:#fff
+    style A fill:#1e3a5f,stroke:#4a90d9,color:#fff
+```
+
+### Where the evidence comes from
+
+The audit does not take the agent's word for it. It reads the harness
+transcript, which records what actually ran.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Hook as 🔒 Stop hook
+    participant Tx as 📜 Transcript<br/>(written by the harness)
+    participant Parser as 🔌 Parser<br/>(vscode / openai-messages)
+    participant LLM as 🧠 Summariser<br/>(fresh context)
+    participant State as 💾 Journal
+
+    Hook->>Tx: read this turn
+    Tx-->>Hook: user.message, assistant.message,<br/>tool.execution_start × N
+    Hook->>Parser: normalise
+    Parser-->>Hook: [{tool, intent, at, ok}]
+
+    Hook->>LLM: items open + tool timeline + agent prose
+    Note right of LLM: "Trust the tool calls<br/>over the prose."
+    LLM-->>Hook: headline, summary,<br/>completed, blockers, next
+
+    Hook->>State: append turn record
+    Note over State: Replayable with<br/>tools/replay.cjs
+```
+
+The key instruction is **trust the tool calls over the prose**. If the agent
+says it ran the tests but no test command appears in the timeline, the report
+says so.
 
 ### The progress journal
 

@@ -6,6 +6,8 @@
 #   ./inspect.sh doctor    # health check: key, model, extraction smoke test
 #   ./inspect.sh caps      # are the input caps right for YOUR history?
 #   ./inspect.sh cost      # what will this cost you per turn and per session?
+#   ./inspect.sh estimate  # cost projected from YOUR ledger's clean-turn ratio
+#   ./inspect.sh otel      # is VS Code writing OpenTelemetry, and how much?
 #   ./inspect.sh events    # which hook events have fired (needs probe enabled)
 #   ./inspect.sh log       # raw probe log
 #   ./inspect.sh clear     # wipe probe log + ledgers
@@ -81,6 +83,12 @@ case "${1:-ledger}" in
     ;;
   cost)
     node "$DIR/cost-report.cjs" "${@:2}"
+    ;;
+  estimate)
+    node "$DIR/estimate.cjs" "${@:2}"
+    ;;
+  otel)
+    node "$DIR/estimate.cjs" --otel "${@:2}"
     ;;
   events)
     if [ ! -f "$PROBE" ]; then

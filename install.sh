@@ -171,13 +171,13 @@ say "  node $(node -v)"
 
 for f in core/index.cjs core/ledger.cjs core/extract.cjs core/llm.cjs core/trace.cjs \
          core/journal.cjs core/parsers.cjs core/changelog.cjs core/review.cjs \
-         core/tools.cjs \
+         core/tools.cjs core/estimate.cjs core/otel.cjs \
          adapters/vscode/session.cjs adapters/vscode/prompt-submitted.cjs \
          adapters/vscode/before-tool.cjs adapters/vscode/after-tool.cjs \
          adapters/vscode/turn-end.cjs adapters/vscode/_io.cjs \
          tools/caps-report.cjs tools/cost-report.cjs tools/inspect.sh \
          tools/verdict-check.cjs tools/audit-preview.cjs tools/replay.cjs \
-         tools/changelog.cjs tools/review.cjs; do
+         tools/changelog.cjs tools/review.cjs tools/estimate.cjs; do
   [ -f "$REPO_DIR/$f" ] || die "missing $REPO_DIR/$f — run this from the repo root."
 done
 say "  hook scripts present"
@@ -288,7 +288,7 @@ done
 # MODULE_NOT_FOUND on a fresh install — and because the adapters catch and emit
 # {}, the failure is silent. There is a CI job that installs into a temp dir and
 # runs a hook to catch exactly this.
-for f in caps-report.cjs cost-report.cjs verdict-check.cjs audit-preview.cjs replay.cjs changelog.cjs review.cjs; do
+for f in caps-report.cjs cost-report.cjs verdict-check.cjs audit-preview.cjs replay.cjs changelog.cjs review.cjs estimate.cjs; do
   run cp "$REPO_DIR/tools/$f" "$DEST/tools/$f"
 done
 run chmod +x "$DEST/tools/replay.cjs"

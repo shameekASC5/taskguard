@@ -26,6 +26,7 @@ const llm = require('./llm.cjs');
 const journal = require('./journal.cjs');
 const changelog = require('./changelog.cjs');
 const review = require('./review.cjs');
+const estimate = require('./estimate.cjs');
 
 /**
  * Collapse semantic duplicates once the ledger has this many open items.
@@ -491,6 +492,24 @@ function shouldReview(turnNumber, clean = false) {
   // Trigger 2: nothing open, opt-in.
   if (clean && process.env.LEDGER_REVIEW_ON_CLEAN === '1') return true;
 
+  // Trigger 3: the clean ratio has crossed the threshold the user set.
+  //
+  // This is the adaptive version of trigger 2. Instead of "review every clean
+  // turn" or "never", it reviews clean turns only while they are RARE — which
+  // is when a clean turn is informative. Once most turns end clean, a clean
+  // turn stops being evidence of anything and reviewing all of them is just
+  // paying for the same verdict repeatedly.
+  //
+  // The threshold comes from the user's own history, so it adapts to how they
+  // actually work rather than to a number someone guessed.
+  if (clean && process.env.LEDGER_REVIEW_CLEAN_BELOW) {
+    const threshold = Number(process.env.LEDGER_REVIEW_CLEAN_BELOW);
+    if (Number.isFinite(threshold) && threshold > 0 && threshold <= 1) {
+      const history = estimate.analyseHistory();
+      if (history.sufficient && history.cleanRatio < threshold) return true;
+    }
+  }
+
   const every = process.env.LEDGER_REVIEW_EVERY === undefined
     ? REVIEW_EVERY_DEFAULT
     : Number(process.env.LEDGER_REVIEW_EVERY);
@@ -602,6 +621,39 @@ async function runReview(sessionId, evidence, opts = {}) {
     lines.push('  ✔ no high-severity gaps');
   }
 
+  // The cost line. A review is the most expensive thing this system does, so
+  // the moment it runs is the moment the user is most likely to wonder what it
+  // costs. Answering that here — from their own history, not an assumed ratio
+  // — is cheaper than making them run a separate command to find out.
+  //
+  // Only shown when there is enough history to say something true. A cost
+  // figure derived from two turns is worse than no figure.
+  if (process.env.LEDGER_REVIEW_COST !== '0') {
+    try {
+      const history = estimate.analyseHistory();
+      if (history.sufficient) {
+        const every = process.env.LEDGER_REVIEW_EVERY === undefined
+          ? REVIEW_EVERY_DEFAULT
+          : Number(process.env.LEDGER_REVIEW_EVERY);
+        const cmp = estimate.compareTriggers({
+          history,
+          perTurnCost: 0.0005,
+          perReviewCost: 0.02,
+          every,
+          turns: Math.max(1, Math.round(history.meanTurnsPerSession || 1)),
+        });
+        if (cmp.off && cmp.on) {
+          lines.push('');
+          lines.push(`  cost: ${history.cleanTurns}/${history.totalTurns} turns clean `
+            + `(${(history.cleanRatio * 100).toFixed(0)}%) · `
+            + `on-clean trigger is ${cmp.multiplier.toFixed(1)}x review cost`);
+        }
+      }
+    } catch {
+      // A cost line must never break a review.
+    }
+  }
+
   return {
     nudge: review.renderNudge(result.findings),
     summary: lines.join('\n'),
@@ -657,6 +709,7 @@ module.exports = {
   onBeforeTool,
   onAfterTool,
   onTurnEnd,
+  shouldReview,
   // Re-exported so adapters need only one require.
   ledger,
   journal,
@@ -665,4 +718,5 @@ module.exports = {
   summariseTurn,
   trace,
   llm,
+  estimate,
 };

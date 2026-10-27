@@ -392,7 +392,10 @@ Configure it in `~/.copilot/hooks/ledger/.env`:
 | `LEDGER_REVIEW_API_KEY` | falls back to `LEDGER_API_KEY` | Key, if a different provider |
 | `LEDGER_REVIEW_EVERY` | `10` | Review every N turns. `0` = scheduled reviews off |
 | `LEDGER_REVIEW_ON_CLEAN` | `0` | Set `1` to also review whenever nothing is open |
+| `LEDGER_REVIEW_CLEAN_BELOW` | — | Review clean turns only while the clean ratio is below this (e.g. `0.5`) |
 | `LEDGER_REVIEW_MAX_STEPS` | `8` | Tool-loop steps per review |
+| `LEDGER_REVIEW_WRITE` | `0` | Set `1` to give the reviewer write tools (see below) |
+| `LEDGER_REVIEW_COST` | `1` | Set `0` to hide the cost line in the review summary |
 | `LEDGER_REVIEW` | `1` | Set `0` to disable review entirely |
 
 **Reasoning is ON for the reviewer, and OFF for everything else.** That is
@@ -419,20 +422,38 @@ average session):
 
 When the agent ends a turn with every item resolved, that is the moment it is
 claiming completion — the highest-value review point, because that is where
-overclaiming happens. It is off by default because it is expensive: measured
-against real sessions, **85% of turns in a long session end with zero open
-items**, so enabling it turns a 4-review session into a ~28-review one.
+overclaiming happens. It is off by default because it is expensive.
+
+**How expensive depends on your own clean-turn ratio, which you can measure.**
+An earlier version of this README claimed 85% of turns end clean. That figure
+was wrong — it was an assumption, not a measurement. Measured against a real
+ledger: **48%**. Run `inspect.sh estimate` to get yours.
 
 | Setting | Reviews (32-turn session) | Session cost |
 |---|---|---|
 | `LEDGER_REVIEW_EVERY=10` (default) | 4 | ~$0.10 |
-| `LEDGER_REVIEW_ON_CLEAN=1` | ~28 | ~$0.60 |
-| Both | ~28 | ~$0.60 |
-| `LEDGER_REVIEW_EVERY=0` | 0 | ~$0.02 |
+| `LEDGER_REVIEW_ON_CLEAN=1` | ~19 | ~$0.40 |
+| Both | ~19 | ~$0.40 |
+| `LEDGER_REVIEW_EVERY=0` | 1 | ~$0.02 |
 
 That is the trade-off: **verification coverage against cost.** Both are cents,
-but one is 6× the other. Turn it on if you have the cost tolerance and want
+but one is ~4× the other. Turn it on if you have the cost tolerance and want
 maximum supervision.
+
+**There is a third trigger, and it is the one to use if you want the middle
+ground: `LEDGER_REVIEW_CLEAN_BELOW=0.5`.**
+
+It reviews clean turns only while clean turns are RARE. A clean turn is
+informative when it is unusual — it means the agent finished everything, which
+is exactly when overclaiming happens. Once most turns end clean, a clean turn
+stops being evidence of anything, and reviewing all of them is paying for the
+same verdict repeatedly.
+
+The threshold is compared against your measured ratio, so it adapts to how you
+actually work rather than to a number someone guessed. With a 48% ratio and a
+0.5 threshold, the trigger fires; if your ratio climbs to 70%, it stops firing
+on its own. Set it to `1` for "always review clean turns" (same as
+`LEDGER_REVIEW_ON_CLEAN=1`), or leave it unset to disable.
 
 Note there is no "session ended" trigger. A genuine one would need a quiet
 period (no new turn for N minutes), which a Stop hook cannot observe — it only
@@ -452,10 +473,38 @@ general-purpose verifier rather than a form-filler.
 | `list_dir` | List a directory |
 | `search` | Search file contents for a literal string |
 
-**No writes. No edits. No git mutations. No installs.** A reviewer that can
-change the thing it is reviewing is no longer independent — it could fix the
-problem and then report it as fine. That is the one line worth holding, and it
-is why this is a read-only surface rather than a full agent.
+**No writes. No edits. No git mutations. No installs — by default.** A reviewer
+that can change the thing it is reviewing is no longer independent: it could
+fix the problem and then report it as fine. That is the one line worth holding,
+and it is why the default is a read-only surface rather than a full agent.
+
+**But it is a default, not a law.** Set `LEDGER_REVIEW_WRITE=1` and the
+reviewer gets two more tools:
+
+| Tool | What it does |
+|---|---|
+| `write_file` | Write a file, creating directories as needed |
+| `edit_file` | Replace an exact string in a file |
+
+In write mode the command denylist is bypassed too, so the reviewer can run
+git, install packages, and change anything the session agent can. The prompt
+changes with it — it is told it has full tools, and told explicitly that it is
+still a reviewer and not a fixer:
+
+> The point of writing is to make a claim CHECKABLE, not to make it true. If
+you fix the bug and then report "confirmed", you have destroyed the evidence
+you were sent to gather.
+
+**Why you might want this.** A reviewer that cannot create a fixture cannot run
+a test that needs one, and a reviewer that cannot instrument a function can
+only ever say "unverified". Read-only is the safer default; write mode is the
+more useful one. That is a trade-off to make deliberately, which is why it is a
+flag rather than the default.
+
+**What does not change in either mode:** file paths are still confined to the
+workspace. A reviewer that can write to `~/.ssh` is a different kind of problem
+from one that can write to your repo, and only the second is a trade-off worth
+offering.
 
 **The injection problem, stated honestly.** The reviewer reads the agent's own
 prose, so a confused or malicious agent could try to steer it into running
@@ -537,6 +586,60 @@ node tools/replay.cjs --latest --otlp > spans.json
 If you already run an OTel collector, point VS Code at it and use the journal
 for the "what did it accomplish" question the spans cannot answer.
 
+#### "I enabled OTel — why is it not in the ledger files?"
+
+Because they are two different files written by two different processes, and
+nothing ever read the OTel one.
+
+| | Written by | Path |
+|---|---|---|
+| The journal | `taskguard`'s Stop hook | `<LEDGER_DIR>/<session>.progress.jsonl` |
+| OTel | VS Code itself | `github.copilot.chat.otel.outfile` |
+
+**The ledger does not depend on OTel, deliberately.** Its tool timeline comes
+from the VS Code *transcript*, which is always present, needs no configuration,
+and is complete even for turns where the hooks did not fire. Depending on OTel
+would mean the journal silently stops working for anyone who has not enabled
+it — and OTel is off by default and needs four settings.
+
+So OTel is treated as optional enrichment. `inspect.sh otel` reads it if it is
+there:
+
+```
+═══ VS Code OpenTelemetry ═══
+
+  outfile:   /tmp/copilot-otel.jsonl
+  exists:    yes
+  size:      2.8 GB
+
+  scanned:   20,000 lines
+  tool spans: 1761
+
+       689  run_in_terminal
+       374  mcp_linear_get_issue
+       184  replace_string_in_file
+       139  read_file
+
+  chat spans: 1640
+    with token usage: 1640
+    input tokens:     633,906,024
+    output tokens:    475,975
+```
+
+**What OTel has that the transcript does not: token counts and durations.** The
+transcript records that a tool ran; OTel records how long it took and what the
+chat call cost in tokens. That is the input a *measured* cost estimate needs,
+as opposed to the modelled one in `inspect.sh cost`.
+
+**The file is big and never rotated.** Measured on a real machine: 2.8 GB,
+26,450 spans, append-only, and VS Code does not clean it up. So the reader
+streams line by line and stops when it has what it needs — it never loads the
+file into memory. `LEDGER_OTEL_SCAN_LINES` (default 20000) bounds the scan.
+
+**It reads span names and numeric attributes only.** With
+`captureContent: true`, OTel spans contain full prompts, responses, and tool
+arguments. The reader never surfaces those — there is a test that asserts it.
+
 ### The audit is strict on purpose
 
 The `turn-end` hook sends the turn's final message to a model with a deliberately harsh prompt. It defaults to `open` when uncertain, and it rejects:
@@ -571,6 +674,10 @@ core/                 framework-agnostic. Knows nothing about any harness.
   journal.cjs         per-turn progress records + tool timeline
   parsers.cjs         transcript parsers, one per harness  <- the portability seam
   llm.cjs             provider-agnostic model client
+  review.cjs          the adversarial reviewer (claims -> plan -> investigate)
+  tools.cjs           the reviewer's tool surface, read-only by default
+  estimate.cjs        cost projection from the ledger's clean-turn ratio
+  otel.cjs            optional reader for VS Code's own OTel output
   trace.cjs           local trace log
 
 adapters/vscode/      thin translation only. ~250 lines, mostly comments.
@@ -986,6 +1093,76 @@ Override the prices if your provider differs:
 LEDGER_PRICE_IN=0.07 LEDGER_PRICE_OUT=0.28
 ```
 
+### What your own history says
+
+`inspect.sh cost` projects from your **transcripts** — prompt sizes, reply
+sizes, turns per session. `inspect.sh estimate` projects from your **ledger**,
+which records something the transcripts do not: for every turn, how many items
+were open at the end.
+
+That single field decides what the on-clean review trigger actually costs, so
+it is the number worth measuring rather than assuming:
+
+```
+═══ clean-turn history ═══
+
+  sessions:        69
+  turns recorded:  116
+  clean turns:     54  (46.6%)
+
+  ratio, three ways:
+    overall (all turns):     46.6%
+    mean per session:        50.1%
+    median per session:      33.3%
+
+  session length:  mean 1.7  median 1
+  long sessions:   mean 8.0  median 8  (7 session(s) with 3+ turns)
+
+  trend (5 session(s) with 4+ turns):
+    first half clean:   48.2%
+    second half clean:  41.7%
+    delta:              -6.5%  degrading
+
+═══ projected session cost ═══
+
+  session length:  8 turns  (mean of long sessions)
+  clean ratio:     46.6%  (measured)
+
+  LEDGER_REVIEW_ON_CLEAN=0  (your current setting)
+    reviews:  1  (0 scheduled + 1 final)
+    total:    $0.00925
+
+  LEDGER_REVIEW_ON_CLEAN=1  (not your current setting)
+    reviews:  5  (0 scheduled + 1 final + 4 on-clean)
+    total:    $0.0213
+
+  Turning on the on-clean trigger multiplies review cost by 2.30x.
+```
+
+**Three things this does that a modelled estimate cannot.**
+
+**It reports the ratio three ways, because they disagree.** The overall ratio
+weights every turn equally; the mean weights every session equally. A 15-turn
+session should not be drowned out by forty 1-turn sessions, so both are shown
+and the difference is visible rather than hidden behind one number.
+
+**It measures session length from the long sessions.** A real ledger collects
+one-turn sessions — a question asked and answered, a test run, a stub from the
+test suite. Measured on a real machine: 69 sessions, mean 1.7 turns. Projecting
+a 2-turn session cost is arithmetically correct and completely useless, because
+nobody installs a supervision hook for two-turn sessions. The projection uses
+the mean of sessions with 3+ turns; the all-session mean is still printed so
+the two figures can be reconciled.
+
+**It refuses to project when the data is too thin.** Two sessions with three
+turns each is the floor. Below that it prints what it has and says so, because
+a projection from two data points is a guess with a dollar sign in front of it.
+
+**The trend line is the one to watch.** A session that starts messy and ends
+clean is improving. If it is degrading, the recent ratio is the one to project
+from — not the lifetime average, because an agent that has learned your
+codebase behaves differently at turn 40 than at turn 4.
+
 ### Are the caps right for you?
 
 Defaults were measured against 2,229 real prompts and 30,281 real responses:
@@ -1014,6 +1191,8 @@ You should see the ledger injected before the first tool call. If the agent answ
 ~/.copilot/hooks/ledger/inspect.sh doctor    # health check + live extraction test
 ~/.copilot/hooks/ledger/inspect.sh caps      # are the input caps right for you?
 ~/.copilot/hooks/ledger/inspect.sh cost      # what will this cost per turn/session?
+~/.copilot/hooks/ledger/inspect.sh estimate  # cost from YOUR clean-turn ratio
+~/.copilot/hooks/ledger/inspect.sh otel      # is VS Code writing OTel, and how much?
 ~/.copilot/hooks/ledger/inspect.sh trace     # what each hook actually did
 ~/.copilot/hooks/ledger/inspect.sh decisions # every block/allow decision
 ~/.copilot/hooks/ledger/inspect.sh watch     # follow the trace live
@@ -1029,7 +1208,7 @@ npm install
 npm test
 ```
 
-26 tests, no network access required. The adapter scripts are executed as real
+258 tests, no network access required. The adapter scripts are executed as real
 child processes with a JSON event on stdin — exactly how VS Code invokes them —
 and the model is stubbed by a local HTTP server. That covers the full contract:
 stdin parsing, ledger persistence, stdout JSON shape, and the block/nudge

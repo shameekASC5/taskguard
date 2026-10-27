@@ -177,20 +177,49 @@ async function planChecks(claims = []) {
 // Phase 3 — investigate
 // ---------------------------------------------------------------------------
 
-const REVIEW_SYSTEM = `You are an adversarial reviewer. Your job is to find out
-whether an agent's claims are TRUE, not to be agreeable.
+/**
+ * The reviewer's system prompt.
+ *
+ * Built per call rather than a constant, because the tool surface it describes
+ * depends on the mode. A prompt that promises tools the model was not offered
+ * is worse than one that promises nothing — the model asks, the call fails,
+ * and it burns steps discovering the mismatch.
+ *
+ * @param {boolean} writes  Whether write tools are available.
+ * @returns {string}
+ */
+function reviewSystem(writes) {
+  const tools = writes
+    ? 'run_command, read_file, list_dir, search, write_file, edit_file'
+    : 'run_command, read_file, list_dir, search';
 
-You have READ-ONLY tools: run_command, read_file, list_dir, search. Use them.
-Do not guess when you can check. If a claim says "33 tests pass", run the test
-suite. If it says "committed as abc123", check git log. If it says "fixed the
-null check", read the file.
+  const capability = writes
+    ? `You have FULL tools: ${tools}. You may write files, edit code, run git,
+and install packages. Use that when it is the only way to check something —
+creating a fixture so a test can run, or instrumenting a function to observe
+what it actually does.
+
+You are still a REVIEWER, not a fixer. The point of writing is to make a claim
+CHECKABLE, not to make it true. If you fix the bug and then report "confirmed",
+you have destroyed the evidence you were sent to gather. So: if you change
+anything, say so in the evidence, and mark the claim by what you found BEFORE
+you changed it.`
+    : `You have READ-ONLY tools: ${tools}. Use them. Do not guess when you can
+check. If a claim says "33 tests pass", run the test suite. If it says
+"committed as abc123", check git log. If it says "fixed the null check", read
+the file.
+
+You CANNOT write, edit, install, or run git mutations. Those are refused. If a
+claim genuinely cannot be checked read-only, mark it "unverified" and say why.`;
+
+  return `You are an adversarial reviewer. Your job is to find out whether an
+agent's claims are TRUE, not to be agreeable.
+
+${capability}
 
 You are NOT here to praise the work. You are here to catch overclaiming,
 fabrication, and work that was described but not done. Assume the agent may
 have been optimistic, and check.
-
-You CANNOT write, edit, install, or run git mutations. Those are refused. If a
-claim genuinely cannot be checked read-only, mark it "unverified" and say why.
 
 Work efficiently: you have a limited number of steps. Prefer one decisive
 command over several exploratory ones. When you have enough evidence, stop and
@@ -203,7 +232,7 @@ Return JSON:
 VERDICTS
   confirmed   — you checked, and the claim holds
   partial     — true in part; the detail or scope is wrong
-  unverified  — you could not check it with read-only tools
+  unverified  — you could not check it with the tools you have
   false       — you checked, and the claim does not hold
 
 RULES
@@ -219,6 +248,7 @@ RULES
    Do not invent problems to seem useful.
 8. Be specific. "The test count is wrong" is weak; "claimed 33 passing, ran
    npm test and got 3 failures in auth.test.js" is strong.`;
+}
 
 /**
  * Run the review.
@@ -255,9 +285,14 @@ async function investigate(input = {}) {
 
   // The reviewer gets a real tool loop. It decides what to run, we execute it,
   // it reads the output and decides what to do next.
+  //
+  // The tool surface and the prompt are both derived from the same mode, so
+  // the model is never offered a tool the prompt did not mention, or told
+  // about a tool it was not offered.
+  const writes = tools.writeMode();
   const maxSteps = Number(process.env.LEDGER_REVIEW_MAX_STEPS) || 8;
-  const run = await callReviewerWithTools(REVIEW_SYSTEM, parts.join('\n\n'), {
-    tools: tools.TOOL_DEFINITIONS,
+  const run = await callReviewerWithTools(reviewSystem(writes), parts.join('\n\n'), {
+    tools: tools.toolDefinitions(),
     execute: (name, args) => tools.executeTool(name, args, workspace || process.cwd()),
     maxSteps,
     timeoutMs: 180000,
@@ -351,6 +386,7 @@ async function review(turn = {}) {
 module.exports = {
   MAX_CLAIMS,
   MAX_CHECKS,
+  reviewSystem,
   extractClaims,
   planChecks,
   investigate,

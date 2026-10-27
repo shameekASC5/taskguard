@@ -335,6 +335,11 @@ describe('hook scripts (end-to-end)', () => {
         LEDGER_TEST_URL: echoStub.url,
         LEDGER_ALLOW_TEST_URL: '1',
         LEDGER_TRACE: '0',
+        // Isolation. This test builds its own env object rather than using
+        // stubEnv(), so it must repeat these or the hook writes a changelog
+        // into the real workspace.
+        LEDGER_DIR: testLedgerDir,
+        LEDGER_CHANGELOG: '0',
       });
 
       // The audit was given the substantive text, so the item resolved and the

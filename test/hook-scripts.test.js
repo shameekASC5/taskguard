@@ -17,6 +17,22 @@ const path = require('node:path');
 const { spawnSync, spawn } = require('node:child_process');
 
 const ADAPTER_DIR = path.join(__dirname, '..', 'adapters', 'vscode');
+
+/**
+ * A throwaway ledger dir for the whole suite.
+ *
+ * The hooks under test write real files. Pointing them at the developer's
+ * home directory means a test run pollutes real state — which is exactly what
+ * happened: eight synthetic sessions ("stop-clean", "stub-*") ended up in the
+ * production changelog index before this was isolated.
+ *
+ * This must be set BEFORE requiring core/ledger.cjs, because that module reads
+ * LEDGER_DIR once at load time. The in-process `ledger` below and the spawned
+ * hooks must agree on the directory, or the assertions read an empty ledger.
+ */
+const testLedgerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tg-hooks-ledger-'));
+process.env.LEDGER_DIR = testLedgerDir;
+
 const ledger = require('../core/ledger.cjs');
 
 /**
@@ -80,6 +96,12 @@ describe('hook scripts (end-to-end)', () => {
 
   afterAll(() => {
     if (stub && stub.child) stub.child.kill();
+    // Remove the throwaway ledger dir so a test run leaves nothing behind.
+    try {
+      fs.rmSync(testLedgerDir, { recursive: true, force: true });
+    } catch {
+      // Best effort.
+    }
   });
 
   const stubEnv = () => ({
@@ -87,6 +109,11 @@ describe('hook scripts (end-to-end)', () => {
     LEDGER_TEST_URL: baseUrl,
     LEDGER_ALLOW_TEST_URL: '1',
     LEDGER_TRACE: '0',
+    // Isolate all state. Without this the hooks write into the developer's
+    // real ~/.copilot/hooks/ledger/.ledger/, which pollutes the changelog
+    // index with synthetic sessions named "stop-clean", "stub-*", and so on.
+    LEDGER_DIR: testLedgerDir,
+    LEDGER_CHANGELOG: '0',
   });
 
   test('ledger-extract pulls items from the prompt and writes the ledger', () => {

@@ -20,3 +20,7 @@ Thumbs.db
 # Node
 node_modules/
 npm-debug.log*
+
+# Session changelogs written by the Stop hook. These are per-session working
+# records; un-ignore this line in your own repo if you want them committed.
+changelog/

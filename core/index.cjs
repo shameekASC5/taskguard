@@ -24,6 +24,7 @@ const { extract, reconcile, collapseDuplicates, summariseTurn } = require('./ext
 const { trace } = require('./trace.cjs');
 const llm = require('./llm.cjs');
 const journal = require('./journal.cjs');
+const changelog = require('./changelog.cjs');
 
 /**
  * Collapse semantic duplicates once the ledger has this many open items.
@@ -203,6 +204,7 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
       resolved: 0,
       blocked: false,
     });
+    writeChangelog(sessionId, opts.workspace);
     trace('core', 'turn-end-allow', { sessionId, reason: 'no-open-items' });
     return { block: false, stillOpen: [], resolved: 0, blocks: led.blockCount || 0 };
   }
@@ -213,7 +215,7 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
   if (blocks > maxBlocks) {
     ledger.save(led);
     await recordTurnReport(sessionId, open, turnEvidence, {
-      openCount: open.length, resolved: 0, blocked: false,
+      openCount: open.length, resolved: 0, blocked: false, workspace: opts.workspace,
     });
     trace('core', 'turn-end-allow', { sessionId, reason: 'max-blocks', blocks });
     return { block: false, stillOpen: open, resolved: 0, blocks };
@@ -230,7 +232,7 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
     stillOpen = ledger.openItems(led);
     if (stillOpen.length === 0) {
       await recordTurnReport(sessionId, open, turnEvidence, {
-        openCount: 0, resolved: open.length, blocked: false,
+        openCount: 0, resolved: open.length, blocked: false, workspace: opts.workspace,
       });
       trace('core', 'turn-end-allow', { sessionId, reason: 'all-resolved' });
       return { block: false, stillOpen: [], resolved: open.length, blocks };
@@ -239,7 +241,7 @@ async function onTurnEnd(sessionId, responseText, opts = {}) {
 
   const resolved = open.length - stillOpen.length;
   await recordTurnReport(sessionId, open, turnEvidence, {
-    openCount: stillOpen.length, resolved, blocked: true,
+    openCount: stillOpen.length, resolved, blocked: true, workspace: opts.workspace,
   });
   trace('core', 'turn-end-block', { sessionId, blocks, stillOpen: stillOpen.length, resolved });
 
@@ -323,6 +325,36 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
     resolved: outcome.resolved,
     blocked: outcome.blocked,
   });
+
+  writeChangelog(sessionId, outcome.workspace);
+}
+
+/**
+ * Persist the session as a changelog.
+ *
+ * Runs every turn; the file is rewritten in place so it stays current rather
+ * than fragmenting into one file per turn.
+ *
+ * Deliberately NOT gated on "did the agent change code". A session that only
+ * searched your filesystem still did work, and a git-diff-only changelog would
+ * record nothing for it. The record is classified by activity instead.
+ *
+ * Never throws: a changelog failure must not break enforcement.
+ */
+function writeChangelog(sessionId, workspace) {
+  if (process.env.LEDGER_CHANGELOG === '0') return;
+  try {
+    const cwd = workspace || process.cwd();
+    changelog.write({
+      sessionId,
+      workspace: cwd,
+      gitRoot: changelog.gitRoot(cwd),
+      turns: journal.readProgress(sessionId),
+      tools: journal.readTelemetry(sessionId),
+    });
+  } catch {
+    // Never let a changelog failure break enforcement.
+  }
 }
 
 module.exports = {

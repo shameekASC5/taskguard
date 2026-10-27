@@ -256,6 +256,53 @@ instrumentation.** The transcript already records every `tool.execution_start`
 with a real timestamp and structured arguments, so there is nothing to add and
 nothing to miss. It is also complete for turns where our hooks did not fire.
 
+### The session changelog
+
+The journal is the source of truth for *what happened*. The changelog is that
+same record **persisted where other systems can consume it** — written
+automatically on every turn, so you never have to remember to run anything.
+
+```bash
+node tools/changelog.cjs --list              # every indexed session
+node tools/changelog.cjs --list --kind code  # only code sessions
+node tools/changelog.cjs --list --since 7d   # last week
+node tools/changelog.cjs --latest            # regenerate the newest
+```
+
+**A changelog is repo-shaped. Agent sessions are not.** That is the design
+problem this solves. A `git diff`-based changelog produces *nothing* for a
+session where you asked the agent to search your filesystem or move files
+around — the work just vanishes. So the record is **classified by activity**
+instead, from the tool timeline:
+
+| Class | Detected from | Needs a repo? |
+|---|---|---|
+| `code` | file writes and edits | no — git section is just omitted |
+| `filesystem` | moves, deletes, renames | no |
+| `research` | reads, searches, fetches | no |
+| `mixed` | more than one of the above | no |
+| `none` | only shell commands, or nothing | no |
+
+Classification comes from the **tool timeline**, not the agent's claims. An
+agent that says it edited files but only ran `ls` classifies as `research`.
+
+**Two outputs:**
+
+| Output | Purpose |
+|---|---|
+| `<workspace>/changelog/YYYY-MM-DD-HHmmss-<session>.md` | Human-readable, committable. Same format as the manual `ChangelogAgent`, so downstream tooling does not care which produced it. |
+| `~/.copilot/hooks/ledger/.ledger/changelog-index.jsonl` | Append-only, one record per session. **Survives across workspaces**, so you can ask "what did agents do this week" without knowing which repo they touched. |
+
+The workspace file is **rewritten in place** each turn — one file per session,
+not 40 fragments. The index is append-only.
+
+**This does not replace the manual `ChangelogAgent`.** That agent reads the
+actual diff and writes prose about *why* each change was made. This hook
+records *what happened* from the timeline. They are complementary: the hook
+gives you automatic coverage, the agent gives you depth when you want it.
+
+Set `LEDGER_CHANGELOG=0` to disable it.
+
 ### OpenTelemetry
 
 VS Code **does** emit OTel for Copilot agent activity — traces, metrics, and
@@ -569,6 +616,7 @@ All optional, all in `~/.copilot/hooks/ledger/.env`:
 | `LEDGER_MAX_OUTPUT_TOKENS` | `2048` | Output cap per call |
 | `LEDGER_REASONING` | `0` | Set `1` to let the model think (see above) |
 | `LEDGER_JOURNAL` | `1` | Set `0` to skip the progress summary call |
+| `LEDGER_CHANGELOG` | `1` | Set `0` to skip writing session changelogs |
 | `LEDGER_MAX_JOURNAL_RECORDS` | `2000` | Max journal records a read returns |
 | `LEDGER_TRANSCRIPT_PARSER` | auto | Force a parser: `vscode`, `openai-messages` |
 | `LEDGER_PRICE_IN` | from table | USD per 1M input tokens |
@@ -802,6 +850,10 @@ never share a ledger.
 | `<session>.json` | every hook | The ledger: open questions and tasks |
 | `<session>.progress.jsonl` | Stop hook | One record per turn: headline, summary, blockers |
 | `<session>.telemetry.jsonl` | Stop hook | One record per tool call: name, intent, timestamp |
+| `changelog-index.jsonl` | Stop hook | One record per session, for downstream systems |
+
+Session changelogs are also written to `<workspace>/changelog/` — see
+[The session changelog](#the-session-changelog).
 
 All are `0600`. See [Security and data exposure](#security-and-data-exposure)
 for what they contain and how to clear them.

@@ -174,6 +174,10 @@ async function main() {
     // it to get this turn's tool calls, so the summariser can check what the
     // agent claims against what actually ran.
     transcriptPath,
+    // Where to write the session changelog. VS Code does not put the workspace
+    // in the Stop event, so fall back to the process cwd, which the harness
+    // sets to the workspace root.
+    workspace: event.workspace_folder || event.workspaceFolder || event.cwd || process.cwd(),
   });
 
   if (!result.block) {

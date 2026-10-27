@@ -255,12 +255,43 @@ describe('replay — rendering', () => {
       blocked: true,
     }, 10);
 
-    expect(out).toContain('turn 3');
+    expect(out).toContain('t3');
     expect(out).toContain('Did the thing.');
     expect(out).toContain('wrote a.js');
     expect(out).toContain('tests failed');
     expect(out).toContain('retry');
-    expect(out).toContain('BLOCKED');
+    expect(out).toContain('⛔');
+  });
+
+  test('renderTurn puts the headline on the turn line', () => {
+    // The headline is the whole point of the replay: a reader scanning the
+    // left column should see what each step achieved without reading detail.
+    const out = replay.renderTurn({
+      turn: 7,
+      at: '2026-10-27T10:00:00.000Z',
+      headline: 'Fixed the duplicate EventBridge targets',
+      summary: 'Longer prose that should not be the first thing shown.',
+      toolCount: 3,
+    }, 10);
+
+    const firstLine = out.split('\n')[0];
+    expect(firstLine).toContain('Fixed the duplicate EventBridge targets');
+    expect(firstLine).not.toContain('Longer prose');
+  });
+
+  test('renderTurn falls back to the first sentence when there is no headline', () => {
+    const out = replay.renderTurn({
+      turn: 2,
+      at: '2026-10-27T10:00:00.000Z',
+      summary: 'Investigated the parser. Then did more.',
+      toolCount: 1,
+    }, 10);
+    expect(out.split('\n')[0]).toContain('Investigated the parser.');
+  });
+
+  test('renderTurn says so when there is no summary at all', () => {
+    const out = replay.renderTurn({ turn: 1, at: '2026-10-27T10:00:00.000Z' }, 10);
+    expect(out).toContain('(no summary)');
   });
 
   test('renderTool shows a failure marker', () => {

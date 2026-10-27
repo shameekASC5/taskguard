@@ -129,6 +129,7 @@ Write a report covering ONLY this turn. Do not summarise the whole session.
 
 Return JSON:
 {
+  "headline": "one short line naming the material effect of this turn",
   "summary": "2-4 sentences on what this turn actually accomplished",
   "completed": ["concrete things finished this turn"],
   "blockers": ["what got in the way, or empty"],
@@ -136,7 +137,28 @@ Return JSON:
   "files": ["paths touched this turn, or empty"]
 }
 
-RULES
+THE HEADLINE IS THE MOST IMPORTANT FIELD.
+It is shown in a timeline next to the turn number, so a reader scanning the
+session can see what each step achieved without reading anything else.
+
+Write it as the MATERIAL EFFECT, not the activity:
+  GOOD: "Fixed the duplicate EventBridge targets"
+  GOOD: "Found the real cause: reasoning tokens ate the output budget"
+  GOOD: "Wrote the installer smoke test; it caught a missing file"
+  BAD:  "Ran 12 tool calls"
+  BAD:  "Used run_in_terminal and read_file"
+  BAD:  "Worked on the task"
+  BAD:  "Made progress"
+
+Rules for the headline:
+  - Under 70 characters.
+  - Start with a verb in the past tense (Fixed, Added, Found, Removed, Wrote).
+  - Name the thing that changed in the world, not the tool that changed it.
+  - If the turn was pure investigation, name what was LEARNED.
+  - If the turn failed, say what failed and why.
+  - No trailing period.
+
+RULES FOR THE REST
 1. TRUST THE TOOL CALLS OVER THE PROSE. If the agent says it ran the tests but
    no test command appears in TOOL CALLS, it did not run the tests. Say so.
 2. Report only what the evidence shows. Do not infer, embellish, or assume.
@@ -179,6 +201,7 @@ async function summariseTurn(turn = {}) {
   if (!out || typeof out !== 'object') return null;
 
   return {
+    headline: typeof out.headline === 'string' ? out.headline.trim().slice(0, 120) : '',
     summary: typeof out.summary === 'string' ? out.summary : '',
     completed: Array.isArray(out.completed) ? out.completed : [],
     blockers: Array.isArray(out.blockers) ? out.blockers : [],

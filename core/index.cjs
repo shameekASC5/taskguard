@@ -313,6 +313,7 @@ async function recordTurnReport(sessionId, openAtStart, evidence, outcome) {
 
   journal.recordTurn(sessionId, {
     turn: journal.turnCount(sessionId) + 1,
+    headline: report?.headline || '',
     summary: report?.summary || '(summary unavailable)',
     completed: report?.completed || [],
     blockers: report?.blockers || [],

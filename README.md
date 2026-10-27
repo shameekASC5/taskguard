@@ -52,17 +52,33 @@ node tools/replay.cjs --latest --follow # live, like tail -f
 
 ```
 ═══ session replay ═══
-span 13:27:15 → 14:02:59 (35m44s)  turns 4  tools 9  resolved 4  blocked 2
+span 13:27:15 → 14:02:59 (35m44s)  turns 4  tools 12  resolved 5  blocked 1
 
-13:27:15 turn 45 ⛔ BLOCKED (1m24s) ▏████████████ 18 tools
-   Refactored the parser and added fixtures; integration tests still failing.
-   ✔ parser module extracted
-   ▲ integration suite fails on empty input
-   → fix the empty-input guard
-   open: 3 ↓1
-13:27:18   👁 read_file src/parser.js
-13:27:20   ✎ replace_string_in_file src/parser.js
+13:27:15 ✓ t1 Fixed the duplicate EventBridge targets 45s ▏████████
+      ✔ target_id pinned on 3 rules
+      → verify plan
+      files: scheduler.tf
+      open: 3 ↓2
+
+13:28:15 ✓ t2 Found the real cause: reasoning tokens ate the output budget 45s ▏██████
+      ✔ reasoning disabled
+      → rerun audit
+      files: llm.cjs
+      open: 2 ↓1
+
+13:29:15 ⛔ t3 Wrote the installer smoke test; it caught a missing file 45s ▏█████████
+      ✔ CI job added
+      ▲ verdict-check.cjs was never copied
+      → fix copy list
+      files: ci.yml
+      open: 1 ↓1
 ```
+
+**Each turn line names the material effect, not the activity.** "Ran 12 tool
+calls" tells you nothing; "Fixed the duplicate EventBridge targets" tells you
+what changed in the world. The summariser is instructed to write the headline
+as a past-tense verb plus the thing that changed, and to name what was
+*learned* when the turn was pure investigation.
 
 **The summary is written by a separate model call, not by the agent.** The
 agent has its own context and an incentive to look successful; asking it to
@@ -77,15 +93,35 @@ instrumentation.** The transcript already records every `tool.execution_start`
 with a real timestamp and structured arguments, so there is nothing to add and
 nothing to miss. It is also complete for turns where our hooks did not fire.
 
-**On OpenTelemetry:** VS Code does not emit OTel for Copilot agent activity —
-there is no OTLP endpoint or span stream to consume. What `taskguard` does
-instead is *emit* its journal in OTLP-compatible shape, following the GenAI
-semantic conventions (`gen_ai.tool.name`, `gen_ai.operation.name`), so the data
-can be shipped to any OTel backend rather than being a private format:
+### OpenTelemetry
+
+VS Code **does** emit OTel for Copilot agent activity — traces, metrics, and
+events, with `invoke_agent`, `chat`, `execute_tool`, and `execute_hook` spans
+following the [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/).
+See [Monitor agent usage with OpenTelemetry](https://code.visualstudio.com/docs/agents/guides/monitoring-agents).
+
+It is **off by default**. To turn it on:
+
+```jsonc
+{
+  "github.copilot.chat.otel.enabled": true,
+  "github.copilot.chat.otel.exporterType": "file",   // or otlp-http, otlp-grpc, console
+  "github.copilot.chat.otel.outfile": "/tmp/copilot-otel.jsonl",
+  "github.copilot.chat.otel.captureContent": true    // needed for tool arguments
+}
+```
+
+`taskguard`'s journal is **complementary, not a replacement**. VS Code's OTel
+gives you spans and token counts; it does not tell you what a turn *achieved*.
+The journal adds the narrative layer on top, and can export in OTLP shape so it
+lands in the same backend:
 
 ```bash
 node tools/replay.cjs --latest --otlp > spans.json
 ```
+
+If you already run an OTel collector, point VS Code at it and use the journal
+for the "what did it accomplish" question the spans cannot answer.
 
 ### The audit is strict on purpose
 

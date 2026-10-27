@@ -88,29 +88,48 @@ function toolBar(count, max) {
 function renderTurn(e, maxTools) {
   const out = [];
   const blocked = e.blocked === true;
-  const flag = blocked ? red('⛔ BLOCKED') : green('✓ ok');
-  const dur = e.startedAt && e.endedAt ? dim(` (${elapsed(e.startedAt, e.endedAt)})`) : '';
+  const flag = blocked ? red('⛔') : green('✓');
+  const dur = e.startedAt && e.endedAt ? dim(` ${elapsed(e.startedAt, e.endedAt)}`) : '';
+
+  // The headline sits on the turn line itself, so scanning the left column
+  // tells the story of the session without reading any detail. This is the
+  // whole point of the replay: "at this step it did that".
+  //
+  // Fallback: when there is no headline, use the first sentence of the
+  // summary. Keep its terminating period — stripping it made the line read
+  // like a truncated fragment.
+  const firstSentence = (() => {
+    const s = String(e.summary || '').trim();
+    if (!s) return '';
+    const m = s.match(/^[^.!?]*[.!?]/);
+    return (m ? m[0] : s).slice(0, 80);
+  })();
+
+  const headline = e.headline
+    ? ` ${bold(e.headline)}`
+    : firstSentence
+      ? ` ${dim(firstSentence)}`
+      : ` ${dim('(no summary)')}`;
 
   out.push(
-    `${dim(clock(e.at))} ${bold(`turn ${e.turn ?? '?'}`)} ${flag}${dur} `
-    + `${toolBar(e.toolCount, maxTools)} ${dim(`${e.toolCount ?? 0} tools`)}`
+    `${dim(clock(e.at))} ${flag} ${dim(`t${e.turn ?? '?'}`)}${headline}`
+    + `${dur} ${toolBar(e.toolCount, maxTools)}`
   );
 
-  if (e.summary) out.push(`   ${e.summary}`);
-
-  for (const item of e.completed || []) out.push(`   ${green('✔')} ${item}`);
-  for (const item of e.blockers || []) out.push(`   ${yellow('▲')} ${item}`);
-  for (const item of e.next || []) out.push(`   ${cyan('→')} ${item}`);
+  // Detail below, only when it adds something the headline did not say.
+  for (const item of e.completed || []) out.push(`      ${green('✔')} ${item}`);
+  for (const item of e.blockers || []) out.push(`      ${yellow('▲')} ${item}`);
+  for (const item of e.next || []) out.push(`      ${cyan('→')} ${item}`);
 
   if (e.files?.length) {
     const shown = e.files.slice(0, 4).map((f) => path.basename(f));
     const more = e.files.length > 4 ? ` +${e.files.length - 4}` : '';
-    out.push(`   ${dim('files: ' + shown.join(', ') + more)}`);
+    out.push(`      ${dim('files: ' + shown.join(', ') + more)}`);
   }
 
   if (e.openCount != null) {
     const resolved = e.resolved ? green(` ↓${e.resolved}`) : '';
-    out.push(`   ${dim(`open: ${e.openCount}`)}${resolved}`);
+    out.push(`      ${dim(`open: ${e.openCount}`)}${resolved}`);
   }
 
   return out.join('\n');

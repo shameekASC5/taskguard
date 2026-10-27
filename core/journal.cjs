@@ -30,13 +30,19 @@
  *
  * WHAT WE DO NOT HAVE
  * -------------------
- * VS Code does not emit OpenTelemetry for Copilot agent activity. There is no
- * OTLP endpoint, no span stream, no `otel` setting. The "Open Inference"
- * conventions are a spec for how to EMIT spans, not a feed to consume.
+ * VS Code DOES emit OpenTelemetry for Copilot agent activity — traces, metrics,
+ * and events, with invoke_agent / chat / execute_tool / execute_hook spans
+ * following the GenAI semantic conventions. See:
+ *   https://code.visualstudio.com/docs/agents/guides/monitoring-agents
  *
- * So we emit our own records in an OTLP-compatible shape (see toOtlpSpan).
- * That keeps the data portable into any OTel backend instead of being a
- * private format, while being honest that the source is the transcript.
+ * It is off by default, and it answers a different question. OTel gives you
+ * spans, durations, and token counts. It does not tell you what a turn
+ * ACHIEVED. That is the gap this journal fills: the narrative layer.
+ *
+ * The two are complementary. If you have an OTel collector running, point
+ * VS Code at it for the span-level view, and use this journal for the
+ * "what did it actually accomplish" view. toOtlpSpan() below emits in the same
+ * shape so both can land in one backend.
  *
  * STORAGE
  * -------
@@ -280,6 +286,9 @@ function recordTurn(sessionId, entry = {}) {
     turn: Number.isFinite(entry.turn) ? entry.turn : null,
     startedAt: entry.startedAt || null,
     endedAt: entry.endedAt || null,
+    // The headline is the one-line material effect shown in the replay
+    // timeline. It is what makes a 40-turn session scannable.
+    headline: String(entry.headline || '').slice(0, 160),
     summary: String(entry.summary || '').slice(0, 2000),
     completed: asStringArray(entry.completed),
     blockers: asStringArray(entry.blockers),
@@ -335,12 +344,13 @@ function clear(sessionId) {
 /**
  * Convert a journal record to an OTLP span.
  *
- * We are not consuming official telemetry — VS Code does not emit any for
- * Copilot agent activity. But emitting in OTLP shape means the data can be
- * shipped to any OpenTelemetry backend (Jaeger, Grafana Tempo, Honeycomb)
- * instead of being locked into a private format.
+ * VS Code emits its own OTel spans (invoke_agent, chat, execute_tool,
+ * execute_hook). This emits the journal's narrative records in the same shape
+ * and under the same GenAI semantic conventions, so a collector can hold both:
+ * the spans tell you what ran and how long it took, these tell you what it
+ * achieved.
  *
- * Follows the OpenTelemetry GenAI semantic conventions where they apply:
+ * Attributes follow the OpenTelemetry GenAI conventions where they apply:
  *   gen_ai.operation.name, gen_ai.tool.name, gen_ai.agent.name
  *
  * @param {object} record  A journal record.

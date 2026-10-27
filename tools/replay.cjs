@@ -64,6 +64,23 @@ function clock(iso) {
     .join(':');
 }
 
+/** Greedy word wrap, so a long summary stays readable in a terminal. */
+function wrapText(text, width) {
+  const words = String(text || '').split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = '';
+  for (const w of words) {
+    if (line && line.length + 1 + w.length > width) {
+      lines.push(line);
+      line = w;
+    } else {
+      line = line ? `${line} ${w}` : w;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
 function elapsed(fromIso, toIso) {
   const a = Date.parse(fromIso);
   const b = Date.parse(toIso);
@@ -85,7 +102,7 @@ function toolBar(count, max) {
   return dim('▏' + '█'.repeat(width));
 }
 
-function renderTurn(e, maxTools) {
+function renderTurn(e, maxTools, opts = {}) {
   const out = [];
   const blocked = e.blocked === true;
   const flag = blocked ? red('⛔') : green('✓');
@@ -115,6 +132,13 @@ function renderTurn(e, maxTools) {
     `${dim(clock(e.at))} ${flag} ${dim(`t${e.turn ?? '?'}`)}${headline}`
     + `${dur} ${toolBar(e.toolCount, maxTools)}`
   );
+
+  // --full shows the summariser's prose. The headline is a one-liner; the
+  // summary is the 2-4 sentence account of what actually happened, which is
+  // what you want when the headline is not enough.
+  if (opts.full && e.summary) {
+    for (const line of wrapText(e.summary, 76)) out.push(`      ${line}`);
+  }
 
   // Detail below, only when it adds something the headline did not say.
   for (const item of e.completed || []) out.push(`      ${green('✔')} ${item}`);
@@ -169,7 +193,7 @@ function render(events, opts = {}) {
   console.log('');
 
   if (opts.turnsOnly) {
-    for (const t of turns) console.log(renderTurn(t, maxTools) + '\n');
+    for (const t of turns) console.log(renderTurn(t, maxTools, opts) + '\n');
     return;
   }
 
@@ -192,7 +216,7 @@ function render(events, opts = {}) {
   }
 
   for (const t of turns) {
-    console.log(renderTurn(t, maxTools));
+    console.log(renderTurn(t, maxTools, opts));
     const own = byTurn.get(t.turn) || [];
     for (const tool of own) console.log(renderTool(tool));
     console.log('');
@@ -265,7 +289,7 @@ function stepThrough(events, opts = {}) {
     const show = () => {
       const t = turns[i];
       console.log('');
-      console.log(renderTurn(t, maxTools));
+      console.log(renderTurn(t, maxTools, opts));
       for (const tool of byTurn.get(t.turn) || []) console.log(renderTool(tool));
       console.log('');
       console.log(dim(`  turn ${i + 1} of ${turns.length}  ·  [enter] next  ·  [a] all  ·  [q] quit`));
@@ -325,6 +349,7 @@ function main(argv) {
   const asJson = args.includes('--json');
   const step = args.includes('--step') || args.includes('-i');
   const all = args.includes('--all');
+  const full = args.includes('--full');
 
   // --last N: show only the newest N turns. The common case when you are
   // watching a session live and do not want to re-read the whole history.
@@ -366,10 +391,10 @@ function main(argv) {
   }
 
   if (step && !all) {
-    return stepThrough(events, { turnsOnly });
+    return stepThrough(events, { turnsOnly, full });
   }
 
-  render(events, { turnsOnly });
+  render(events, { turnsOnly, full });
 
   if (follow) {
     // Poll rather than fs.watch: the journal is append-only and polling is
@@ -391,5 +416,15 @@ function main(argv) {
   return 0;
 }
 
-if (require.main === module) process.exit(main(process.argv));
+if (require.main === module) {
+  // main() returns a Promise when --step is used, because stepping waits for
+  // keypresses. process.exit() requires a number, so awaiting is mandatory —
+  // passing the Promise straight through throws ERR_INVALID_ARG_TYPE.
+  Promise.resolve(main(process.argv))
+    .then((code) => process.exit(code))
+    .catch((err) => {
+      console.error(err.message);
+      process.exit(1);
+    });
+}
 module.exports = { render, renderTurn, renderTool, latestSession, glyph, elapsed };

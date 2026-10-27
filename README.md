@@ -208,10 +208,35 @@ in the last 30 minutes?"* — and on a long run that is the question you actuall
 have. So every turn also appends a record to a journal you can replay:
 
 ```bash
-node tools/replay.cjs --latest          # the whole session, as a timeline
-node tools/replay.cjs --latest --turns  # just the turn summaries
-node tools/replay.cjs --latest --follow # live, like tail -f
+node tools/replay.cjs <sessionId> --step      # step through, Enter for next
+node tools/replay.cjs <sessionId> --last 3    # just the newest 3 turns
+node tools/replay.cjs <sessionId>             # the whole thing at once
+node tools/replay.cjs <sessionId> --turns     # summaries only, no tool calls
+node tools/replay.cjs <sessionId> --follow    # live, like tail -f
 ```
+
+**`--step` is the one to use on a long session.** Reading 40 turns as one wall
+of text means scrolling past the part you cared about. Stepping shows one turn
+at a time:
+
+```
+═══ stepping through 12 turn(s) ═══
+
+14:15:11 ✓ t1 Fixed the duplicate EventBridge targets 45s ▏████████
+      ✔ target_id pinned on 3 rules
+      open: 3 ↓2
+14:15:12   ⌘ run_in_terminal terraform plan
+
+  turn 1 of 12  ·  [enter] next  ·  [a] all  ·  [q] quit
+```
+
+`[enter]` advances, `[a]` dumps the rest, `[q]` stops. When stdout is not a
+terminal (piped, CI) it prints everything rather than waiting for a keypress
+that can never arrive.
+
+**`--last N` is for watching a session live.** You do not want to re-read all
+ten turns every time you check in — `--last 2` shows just the newest two, with
+their tool calls.
 
 ```
 ═══ session replay ═══
@@ -262,17 +287,35 @@ The journal is the source of truth for *what happened*. The changelog is that
 same record **persisted where other systems can consume it** — written
 automatically on every turn, so you never have to remember to run anything.
 
-```bash
-node tools/changelog.cjs --list              # every indexed session
-node tools/changelog.cjs --list --kind code  # only code sessions
-node tools/changelog.cjs --list --since 7d   # last week
-node tools/changelog.cjs --list --all        # ignore the 5000-record cap
-node tools/changelog.cjs --latest            # regenerate the newest
+**Reading never writes. Writing is a separate verb.**
 
+```bash
+# READ — no side effects
+node tools/changelog.cjs --list                # every indexed session
+node tools/changelog.cjs --list --kind code    # only code sessions
+node tools/changelog.cjs --list --since 7d     # last week
+node tools/changelog.cjs --list --all          # ignore the 5000-record cap
+node tools/changelog.cjs --show <sessionId>    # print the changelog
+node tools/changelog.cjs --path <sessionId>    # print just the file path
+
+# WRITE — regenerates the file on disk
+node tools/changelog.cjs --write <sessionId>
+
+# MAINTENANCE
 node tools/changelog.cjs --prune --keep 500        # keep the newest 500
 node tools/changelog.cjs --prune --older-than 30d  # drop records older than 30d
 node tools/changelog.cjs --prune --dry-run         # report, change nothing
 ```
+
+`--show` and `--path` never touch the disk. `--write` is the only command that
+regenerates a file, and it says so when it does. A bare session id defaults to
+the read path and tells you how to write.
+
+**Files are named by date plus a slug of the first headline**, not the session
+UUID — `2026-10-27T05-14-40-fixed-the-retry-logic-f03aef.md` rather than
+`2026-10-27T05-14-40-f03aef59-33eb-41bd-9298-81d48f52c4d8.md`. A UUID is
+unique but unreadable; the headline is what you scan for. A short session
+prefix is kept so two sessions with the same opening headline cannot collide.
 
 **The index is append-only and never pruned automatically.** `--list` reads the
 newest 5,000 records by default and **says so when it truncates** — a list that

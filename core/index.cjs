@@ -191,10 +191,12 @@ function renderLookHint(sessionId, stats = {}) {
   if (stats.kind) lines.push(`  activity: ${stats.kind}`);
 
   lines.push('');
-  lines.push('  Replay this session:');
-  lines.push(`    node ${tools}/replay.cjs ${sessionId}`);
-  lines.push('  Changelog:');
-  lines.push(`    node ${tools}/changelog.cjs ${sessionId}`);
+  lines.push('  Replay this session (step through):');
+  lines.push(`    node ${tools}/replay.cjs ${sessionId} --step`);
+  lines.push('  Replay the last 3 turns only:');
+  lines.push(`    node ${tools}/replay.cjs ${sessionId} --last 3`);
+  lines.push('  Read the changelog (no writes):');
+  lines.push(`    node ${tools}/changelog.cjs --show ${sessionId}`);
   if (stats.changelogPath) {
     lines.push(`    ${stats.changelogPath}`);
   }

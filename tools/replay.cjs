@@ -221,13 +221,123 @@ function latestSession() {
   return newest.n.replace('.progress.jsonl', '');
 }
 
+/**
+ * Step through turns one at a time, waiting for Enter between each.
+ *
+ * Reading a 40-turn session as one wall of text is useless — you scroll past
+ * the part you cared about. Stepping lets you actually read each turn and stop
+ * when you have seen enough.
+ *
+ * Falls back to printing everything when stdin is not a TTY (piped output,
+ * CI), because waiting for a keypress that can never arrive would hang.
+ *
+ * @param {Array} events   Full timeline.
+ * @param {object} opts    { turnsOnly, maxTools }
+ * @returns {Promise<number>} exit code
+ */
+function stepThrough(events, opts = {}) {
+  const turns = events.filter((e) => e.kind === 'turn');
+  const maxTools = turns.reduce((m, t) => Math.max(m, t.toolCount || 0), 0);
+
+  if (!turns.length) {
+    console.log(dim('No turns recorded for this session yet.'));
+    return Promise.resolve(0);
+  }
+
+  // Group tools under their turn, same as the full render.
+  const byTurn = new Map();
+  for (const e of events.filter((x) => x.kind === 'tool')) {
+    if (!Number.isFinite(e.turn)) continue;
+    if (!byTurn.has(e.turn)) byTurn.set(e.turn, []);
+    byTurn.get(e.turn).push(e);
+  }
+
+  const interactive = process.stdin.isTTY && process.stdout.isTTY;
+  if (!interactive) {
+    // Not a terminal: print everything rather than block forever.
+    render(events, opts);
+    return Promise.resolve(0);
+  }
+
+  return new Promise((resolve) => {
+    let i = 0;
+
+    const show = () => {
+      const t = turns[i];
+      console.log('');
+      console.log(renderTurn(t, maxTools));
+      for (const tool of byTurn.get(t.turn) || []) console.log(renderTool(tool));
+      console.log('');
+      console.log(dim(`  turn ${i + 1} of ${turns.length}  ·  [enter] next  ·  [a] all  ·  [q] quit`));
+    };
+
+    const onData = (buf) => {
+      const key = buf.toString().trim().toLowerCase();
+
+      if (key === 'q' || key === '\u0003') {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdin.removeListener('data', onData);
+        console.log(dim('\nstopped.'));
+        resolve(0);
+        return;
+      }
+
+      if (key === 'a') {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdin.removeListener('data', onData);
+        console.log('');
+        render(events, opts);
+        resolve(0);
+        return;
+      }
+
+      // Enter (or anything else) advances.
+      i += 1;
+      if (i >= turns.length) {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdin.removeListener('data', onData);
+        console.log(dim('end of session.'));
+        resolve(0);
+        return;
+      }
+      show();
+    };
+
+    // Raw mode so a single keypress advances, without needing Enter to be
+    // echoed or the terminal to buffer a whole line.
+    if (process.stdin.setRawMode) process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.on('data', onData);
+
+    console.log(bold(`═══ stepping through ${turns.length} turn(s) ═══`));
+    show();
+  });
+}
+
 function main(argv) {
   const args = argv.slice(2);
   const turnsOnly = args.includes('--turns');
   const follow = args.includes('--follow');
   const asOtlp = args.includes('--otlp');
   const asJson = args.includes('--json');
-  let sessionId = args.find((a) => !a.startsWith('--'));
+  const step = args.includes('--step') || args.includes('-i');
+  const all = args.includes('--all');
+
+  // --last N: show only the newest N turns. The common case when you are
+  // watching a session live and do not want to re-read the whole history.
+  const lastIdx = args.indexOf('--last');
+  const lastN = lastIdx !== -1 ? Number(args[lastIdx + 1]) : null;
+  if (lastIdx !== -1 && (!Number.isFinite(lastN) || lastN <= 0)) {
+    console.error(`invalid --last value: ${args[lastIdx + 1]} (use a positive integer)`);
+    return 2;
+  }
+
+  const consumed = new Set();
+  if (lastIdx !== -1) consumed.add(args[lastIdx + 1]);
+  let sessionId = args.find((a) => !a.startsWith('--') && !consumed.has(a));
 
   if (args.includes('--latest') || !sessionId) sessionId = latestSession();
   if (!sessionId) {
@@ -245,7 +355,21 @@ function main(argv) {
     return 0;
   }
 
-  render(journal.timeline(sessionId), { turnsOnly });
+  let events = journal.timeline(sessionId);
+
+  // Trim to the newest N turns, keeping each turn's tool calls with it.
+  if (Number.isFinite(lastN)) {
+    const turnRecords = events.filter((e) => e.kind === 'turn');
+    const keep = new Set(turnRecords.slice(-lastN).map((t) => t.turn));
+    events = events.filter((e) => e.kind !== 'turn' || keep.has(e.turn));
+    events = events.filter((e) => e.kind !== 'tool' || keep.has(e.turn));
+  }
+
+  if (step && !all) {
+    return stepThrough(events, { turnsOnly });
+  }
+
+  render(events, { turnsOnly });
 
   if (follow) {
     // Poll rather than fs.watch: the journal is append-only and polling is
@@ -254,12 +378,12 @@ function main(argv) {
     let seen = journal.timeline(sessionId).length;
     console.log(dim(`following ${sessionId} — ctrl-c to stop`));
     setInterval(() => {
-      const all = journal.timeline(sessionId);
-      if (all.length > seen) {
-        for (const e of all.slice(seen)) {
+      const allEvents = journal.timeline(sessionId);
+      if (allEvents.length > seen) {
+        for (const e of allEvents.slice(seen)) {
           console.log(e.kind === 'turn' ? renderTurn(e, 0) : renderTool(e));
         }
-        seen = all.length;
+        seen = allEvents.length;
       }
     }, 1000);
   }

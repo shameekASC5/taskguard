@@ -174,31 +174,87 @@ function prune(opts) {
   return 0;
 }
 
-function regenerate(sessionId) {
+/** Load a session's journal records, or null if there are none. */
+function loadSession(sessionId) {
   const turns = journal.readProgress(sessionId);
   const tools = journal.readTelemetry(sessionId);
+  if (!turns.length && !tools.length) return null;
+  return { turns, tools };
+}
 
-  if (!turns.length && !tools.length) {
+/** Where this session's changelog lives, from the index or by derivation. */
+function changelogPathFor(sessionId) {
+  const prior = changelog.readIndex(Infinity).filter((r) => r.sessionId === sessionId).pop();
+  return prior?.changelogPath || '';
+}
+
+/**
+ * Print the changelog to stdout. Writes nothing.
+ *
+ * This is the read path. It renders from the journal rather than reading the
+ * file, so it works even when the file was never written (LEDGER_CHANGELOG=0,
+ * or a session that predates the feature).
+ */
+function show(sessionId) {
+  const session = loadSession(sessionId);
+  if (!session) {
+    console.error(`No journal records for session "${sessionId}".`);
+    return 1;
+  }
+
+  const prior = changelog.readIndex(Infinity).filter((r) => r.sessionId === sessionId).pop();
+  const workspace = prior?.workspace || process.cwd();
+
+  process.stdout.write(changelog.renderMarkdown({
+    sessionId,
+    workspace,
+    gitRoot: changelog.gitRoot(workspace),
+    turns: session.turns,
+    tools: session.tools,
+  }));
+  return 0;
+}
+
+/** Print just the file path. Writes nothing. */
+function showPath(sessionId) {
+  const p = changelogPathFor(sessionId);
+  if (!p) {
+    console.error(`No changelog file recorded for session "${sessionId}".`);
+    console.error(dim('  Run --write to generate one.'));
+    return 1;
+  }
+  console.log(p);
+  return 0;
+}
+
+/**
+ * Regenerate the changelog file on disk.
+ *
+ * The only command that writes. Says so, so it is never mistaken for a read.
+ */
+function regenerate(sessionId) {
+  const session = loadSession(sessionId);
+  if (!session) {
     console.error(`No journal records for session "${sessionId}".`);
     return 1;
   }
 
   // The workspace is not stored in the journal, so take it from the index if
   // this session was written before, else fall back to cwd.
-  const prior = changelog.readIndex(5000).filter((r) => r.sessionId === sessionId).pop();
+  const prior = changelog.readIndex(Infinity).filter((r) => r.sessionId === sessionId).pop();
   const workspace = prior?.workspace || process.cwd();
 
   const r = changelog.write({
     sessionId,
     workspace,
     gitRoot: changelog.gitRoot(workspace),
-    turns,
-    tools,
+    turns: session.turns,
+    tools: session.tools,
   });
 
   if (r.written) {
     console.log(`${green('✔')} wrote ${r.path}`);
-    console.log(dim(`  activity: ${r.kind} · ${turns.length} turn(s) · ${tools.length} tool call(s)`));
+    console.log(dim(`  activity: ${r.kind} · ${session.turns.length} turn(s) · ${session.tools.length} tool call(s)`));
     return 0;
   }
 
@@ -213,20 +269,30 @@ function flagValue(args, name) {
 }
 
 function usage() {
-  console.log(`changelog — regenerate a session changelog, or query the index.
+  console.log(`changelog — read a session changelog, or manage the index.
 
-  node tools/changelog.cjs --latest              regenerate the newest session
-  node tools/changelog.cjs <sessionId>           regenerate one session
-
+READING (no side effects)
   node tools/changelog.cjs --list                list indexed sessions
   node tools/changelog.cjs --list --kind code    filter by activity class
   node tools/changelog.cjs --list --since 7d     filter by age
   node tools/changelog.cjs --list --all          ignore the ${LIST_LIMIT}-record cap
   node tools/changelog.cjs --list --json         machine-readable
 
+  node tools/changelog.cjs --show <sessionId>    print the changelog to stdout
+  node tools/changelog.cjs --show --latest       print the newest one
+  node tools/changelog.cjs --path <sessionId>    print just the file path
+
+WRITING (regenerates the file on disk)
+  node tools/changelog.cjs --write <sessionId>   regenerate one session
+  node tools/changelog.cjs --write --latest      regenerate the newest
+
+MAINTENANCE
   node tools/changelog.cjs --prune --keep 500        keep the newest 500
   node tools/changelog.cjs --prune --older-than 30d  drop records older than 30d
   node tools/changelog.cjs --prune --dry-run         report, change nothing
+
+--show and --path never write anything. --write is the only command that
+regenerates a file, and it says so when it does.
 
 The index is append-only and never pruned automatically. --list reads the
 newest ${LIST_LIMIT} records by default and says so when it truncates.`);
@@ -264,7 +330,19 @@ function main(argv) {
     return 2;
   }
 
-  return regenerate(sessionId);
+  // Explicit verbs. A bare session id used to regenerate silently, which made
+  // it impossible to tell a read from a write.
+  if (args.includes('--show')) return show(sessionId);
+  if (args.includes('--path')) return showPath(sessionId);
+  if (args.includes('--write')) return regenerate(sessionId);
+
+  // No verb: default to the read path, and say how to write.
+  const rc = show(sessionId);
+  if (rc === 0) {
+    console.error('');
+    console.error(dim(`(read-only. To regenerate the file: --write ${sessionId})`));
+  }
+  return rc;
 }
 
 if (require.main === module) process.exit(main(process.argv));

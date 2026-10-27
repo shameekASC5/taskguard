@@ -280,6 +280,41 @@ function renderMarkdown(session) {
 }
 
 /**
+ * Turn a session's headlines into a short, human-readable filename slug.
+ *
+ * A session UUID is unreadable — you cannot tell `2026-10-27T05-14-40-
+ * f03aef59-33eb-41bd-9298-81d48f52c4d8.md` from any other file. The first
+ * headline says what the session was about, which is what you actually scan
+ * for.
+ *
+ * Falls back to the session id when there are no headlines, so the name is
+ * always unique and always present.
+ *
+ * @param {Array} turns
+ * @param {string} sessionId
+ * @returns {string}
+ */
+function slugFrom(turns, sessionId) {
+  const headline = (turns || []).map((t) => t.headline).find((h) => h && h.trim());
+
+  if (!headline) {
+    return String(sessionId || 'session').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 40);
+  }
+
+  const slug = headline
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')   // non-alphanumerics become dashes
+    .replace(/^-+|-+$/g, '')       // trim leading/trailing dashes
+    .slice(0, 48)
+    .replace(/-+$/, '');           // trim again after the slice
+
+  // Keep a short session prefix so two sessions with the same opening headline
+  // do not collide.
+  const short = String(sessionId || '').replace(/[^a-zA-Z0-9]/g, '').slice(0, 6);
+  return slug ? `${slug}-${short}` : String(sessionId || 'session').slice(0, 40);
+}
+
+/**
  * Write the session changelog to the workspace and append to the index.
  *
  * Never throws: a changelog failure must not break the Stop hook.
@@ -312,14 +347,14 @@ function write(session) {
       fs.mkdirSync(dir, { recursive: true });
 
       // One file per session, rewritten each turn so it stays current.
+      //
+      // Named by date + a slug of the first headline, not the session UUID.
+      // The UUID is unique but unreadable; the headline is what you scan for.
       const stamp = new Date(session.turns?.[0]?.at || Date.now())
         .toISOString()
         .replace(/[:.]/g, '-')
         .slice(0, 19);
-      const safe = String(session.sessionId || 'session')
-        .replace(/[^a-zA-Z0-9_-]/g, '_')
-        .slice(0, 40);
-      filePath = path.join(dir, `${stamp}-${safe}.md`);
+      filePath = path.join(dir, `${stamp}-${slugFrom(session.turns, session.sessionId)}.md`);
 
       fs.writeFileSync(filePath, renderMarkdown(session), { mode: 0o644 });
     }
@@ -449,6 +484,7 @@ module.exports = {
   classify,
   filesTouched,
   renderMarkdown,
+  slugFrom,
   write,
   readIndex,
   pruneIndex,

@@ -73,8 +73,24 @@ describe('hint — content', () => {
     const out = runTurnEnd({ sessionId, transcript: writeTranscript() });
 
     expect(out.systemMessage).toContain(`replay.cjs ${sessionId}`);
-    expect(out.systemMessage).toContain(`changelog.cjs ${sessionId}`);
+    expect(out.systemMessage).toContain(`changelog.cjs --show ${sessionId}`);
     expect(out.systemMessage).not.toContain('--latest');
+  });
+
+  test('offers the step-through and last-N forms', () => {
+    const sessionId = 'sess-abc-123';
+    const out = runTurnEnd({ sessionId, transcript: writeTranscript() });
+
+    expect(out.systemMessage).toContain('--step');
+    expect(out.systemMessage).toContain('--last 3');
+  });
+
+  test('the changelog command is the read-only one', () => {
+    // --show never writes. The hint must not suggest a command that
+    // regenerates a file when the user only wants to look.
+    const out = runTurnEnd({ sessionId: 'sess-1', transcript: writeTranscript() });
+    expect(out.systemMessage).toContain('--show');
+    expect(out.systemMessage).not.toContain('--write');
   });
 
   test('shows a short session prefix so concurrent sessions are distinguishable', () => {

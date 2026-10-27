@@ -251,6 +251,57 @@ describe('changelog — writing', () => {
   });
 });
 
+describe('changelog — filename slug', () => {
+  test('uses the first headline, not the session id', () => {
+    // A UUID is unique but unreadable. The headline is what you scan for.
+    const slug = changelog.slugFrom(
+      [{ headline: 'Fixed the duplicate EventBridge targets' }],
+      'f03aef59-33eb-41bd-9298-81d48f52c4d8'
+    );
+    expect(slug).toContain('fixed-the-duplicate-eventbridge-targets');
+    expect(slug).not.toContain('f03aef59-33eb');
+  });
+
+  test('keeps a short session prefix so two sessions cannot collide', () => {
+    const a = changelog.slugFrom([{ headline: 'Fixed the bug' }], 'aaaaaa-1111');
+    const b = changelog.slugFrom([{ headline: 'Fixed the bug' }], 'bbbbbb-2222');
+    expect(a).not.toBe(b);
+  });
+
+  test('falls back to the session id when there is no headline', () => {
+    expect(changelog.slugFrom([], 'noslug-1234-5678')).toContain('noslug');
+    expect(changelog.slugFrom([{ headline: '   ' }], 'blank-1234')).toContain('blank');
+  });
+
+  test('produces a filesystem-safe slug', () => {
+    const slug = changelog.slugFrom(
+      [{ headline: 'Found the cause: tokens/ate the budget (really!)' }],
+      'abc123'
+    );
+    expect(slug).toMatch(/^[a-z0-9-]+$/);
+    expect(slug).not.toMatch(/--/);
+    expect(slug).not.toMatch(/^-|-$/);
+  });
+
+  test('caps the length so the filename stays manageable', () => {
+    const long = 'a'.repeat(200);
+    const slug = changelog.slugFrom([{ headline: long }], 'abc123');
+    expect(slug.length).toBeLessThan(70);
+  });
+
+  test('the written file uses the slug', () => {
+    const ws = path.join(tmpDir, 'ws');
+    fs.mkdirSync(ws);
+    const r = changelog.write({
+      sessionId: 'f03aef59-33eb-41bd-9298-81d48f52c4d8',
+      workspace: ws,
+      turns: [{ turn: 1, at: '2026-10-27T10:00:00Z', headline: 'Fixed the retry logic' }],
+      tools: [tool('create_file', '/ws/a.js')],
+    });
+    expect(path.basename(r.path)).toContain('fixed-the-retry-logic');
+  });
+});
+
 describe('changelog — index reading and truncation', () => {
   /** Seed N index records, oldest first. */
   function seed(n) {
